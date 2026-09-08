@@ -3,8 +3,7 @@
   "rootNamespace": "UniGame.StaticEcs.Network.LiteNetLib",
   "references": [
     "unigame.staticecs.network",
-    "unigame.staticecs.network.protocol",
-    "LiteNetLib"
+    "unigame.staticecs.network.protocol"
   ],
   "autoReferenced": true,
   "overrideReferences": false,

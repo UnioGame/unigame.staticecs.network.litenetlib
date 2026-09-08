@@ -12,16 +12,9 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="NUnit" Version="4.2.2" />
     <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
-    <PackageReference Include="LiteNetLib" Version="2.1.4" />
-    <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="6.0.0" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="../../Runtime/LiteNetLibTransport.cs" Link="Runtime/LiteNetLibTransport.cs" />
+    <ProjectReference Include="../LiteNetLib.csproj" />
     <Compile Include="../../Tests/Editor/LiteNetLibAdapterTests.cs" Link="Tests/LiteNetLibAdapterTests.cs" />
-    <Compile Include="../../../unigame.staticecs.network/Protocol/*.cs" Link="Protocol/%(Filename)%(Extension)" />
-    <Compile Include="$(GameRepositoryRoot)/GameClient/Library/PackageCache/com.felid-force-studios.static-pack@5ecf19df31a2/Src/**/*.cs" Link="StaticPack/%(RecursiveDir)%(Filename)%(Extension)" />
-    <Compile Include="$(GameRepositoryRoot)/GameClient/Library/PackageCache/com.felid-force-studios.static-ecs@23b1cf36d894/Src/**/*.cs" Link="StaticEcs/%(RecursiveDir)%(Filename)%(Extension)" />
-    <Compile Include="../../../unigame.staticecs.network/Runtime/MemoryNetworkTransport.cs" Link="Network/MemoryNetworkTransport.cs" />
-    <Compile Include="../../../unigame.staticecs.network/Runtime/NetworkSessionContracts.cs" Link="Network/NetworkSessionContracts.cs" />
   </ItemGroup>
 </Project>

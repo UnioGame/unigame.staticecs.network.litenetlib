@@ -4,8 +4,7 @@
   "references": [
     "unigame.staticecs.network.litenetlib",
     "unigame.staticecs.network.protocol",
-    "unigame.staticecs.network",
-    "LiteNetLib"
+    "unigame.staticecs.network"
   ],
   "includePlatforms": ["Editor"],
   "excludePlatforms": [],

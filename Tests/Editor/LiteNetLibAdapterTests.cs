@@ -2,13 +2,14 @@ using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using Native = global::LiteNetLib;
 using NUnit.Framework;
 using UniGame.StaticEcs.Network;
 
 namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
 {
     [TestFixture]
-    public sealed class AdapterTests
+    public sealed class LiteNetLibAdapterTests
     {
         [Test]
         public void LimitsMatchNativeHeaders()
@@ -167,6 +168,418 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             }
         }
 
+        [Test]
+        public void FragmentedReliableDeliveryRetainsLeaseUntilOneMessageCallback()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 8;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var callbacksBefore = client.CaptureDiagnostics().DeliveryCallbacks;
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                        PacketFlags.ReliableOrdered, 60000, 20)), Is.True);
+
+                    client.Update();
+                    client.Flush();
+                    var stalled = client.CaptureDiagnostics();
+                    Assert.That(stalled.NativeReliableFragments, Is.GreaterThan(1));
+                    Assert.That(stalled.NativeReliableBytes, Is.GreaterThan(60000));
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+
+                    var received = WaitForReceive(server, client, serverEndpoint);
+                    received.Dispose();
+                    WaitForDeliveryAtLeast(server, client, callbacksBefore + 1);
+
+                    var complete = client.CaptureDiagnostics();
+                    Assert.That(complete.NativeReliableFragments, Is.Zero);
+                    Assert.That(complete.NativeReliableBytes, Is.Zero);
+                    Assert.That(complete.OutstandingLeases, Is.Zero);
+                    Assert.That(complete.DeliveryCallbacks - callbacksBefore, Is.EqualTo(1));
+                }
+            }
+        }
+
+        [Test]
+        public void NativeFragmentCountLimitRejectsPermissivePeer()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var native = new NativePeerHarness(port,
+                       LiteNetLibLimits.MaximumFragmentsCount + 1))
+            {
+                var endpoint = WaitForNativeAccept(server, native);
+                var before = server.CaptureDiagnostics();
+                var tooManyFragments = new byte[
+                    checked((LiteNetLibLimits.MaximumFragmentsCount + 1) *
+                        LiteNetLibLimits.ReliableFragmentPayloadBytes)];
+                native.Send(tooManyFragments, Native.DeliveryMethod.ReliableOrdered);
+
+                for (var i = 0; i < 500; i++)
+                {
+                    native.Pump();
+                    server.Update();
+                    server.Flush();
+                    Thread.Sleep(1);
+                }
+
+                var after = server.CaptureDiagnostics();
+                Assert.That(after.ReceivedPackets, Is.EqualTo(before.ReceivedPackets));
+                Assert.That(after.MalformedPackets, Is.EqualTo(before.MalformedPackets));
+                Assert.That(endpoint.TryReceive(out var packet), Is.False);
+                Assert.That(native.IsConnected, Is.True);
+                Assert.That(after.Connections, Is.EqualTo(1));
+            }
+        }
+
+        [Test]
+        public void PostReassemblyReliableOversizeDisconnectsSender()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var native = new NativePeerHarness(port,
+                       LiteNetLibLimits.MaximumFragmentsCount))
+            {
+                WaitForNativeAccept(server, native);
+                var oversized = new byte[LiteNetLibLimits.MaximumReliableBytes + 1];
+                native.Send(oversized, Native.DeliveryMethod.ReliableOrdered);
+
+                var disconnected = false;
+                for (var i = 0; i < 1200; i++)
+                {
+                    native.Pump();
+                    server.Update();
+                    server.Flush();
+                    if (server.TryDequeueDisconnected(out var connection))
+                    {
+                        Assert.That(connection.Value, Is.GreaterThan(0));
+                        disconnected = true;
+                        break;
+                    }
+                    Thread.Sleep(1);
+                }
+
+                var diagnostics = server.CaptureDiagnostics();
+                Assert.That(disconnected, Is.True);
+                Assert.That(diagnostics.MalformedPackets, Is.GreaterThanOrEqualTo(1));
+                Assert.That(diagnostics.Connections, Is.Zero);
+                Assert.That(diagnostics.OutstandingLeases, Is.Zero);
+            }
+        }
+
+        [Test]
+        public void EveryRejectedSendConsumesItsLease()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.ReliableSendQueueCapacity = 1;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(pool.Rent(PacketHeader.Size - 1)), Is.False);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered,
+                        LiteNetLibLimits.MaximumReliableBytes - PacketHeader.Size + 1)), Is.False);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.UnreliableSequenced,
+                        client.Endpoint.MaxUnreliablePayloadBytes - PacketHeader.Size + 1)), Is.False);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.False);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+
+                    var first = WaitForReceive(server, client, serverEndpoint);
+                    first.Dispose();
+                    var second = WaitForReceive(server, client, serverEndpoint);
+                    second.Dispose();
+                    WaitForDeliveryAtLeast(server, client, 2);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+
+                    client.Endpoint.Dispose();
+                    Assert.That(client.Endpoint.TrySend(pool.Rent(PacketHeader.Size)), Is.False);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void UnreliableReceiveOverflowDropsPacketWithoutDisconnectingPeer()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 1;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    for (var i = 0; i < 4; i++)
+                    {
+                        Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.UnreliableSequenced, 32)), Is.True);
+                        client.Flush();
+                    }
+
+                    for (var i = 0; i < 500; i++)
+                    {
+                        client.Update();
+                        client.Flush();
+                        server.Update();
+                        server.Flush();
+                        if (server.CaptureDiagnostics().UnreliableReceiveDrops > 0)
+                            break;
+                        Thread.Sleep(1);
+                    }
+
+                    var diagnostics = server.CaptureDiagnostics();
+                    Assert.That(diagnostics.UnreliableReceiveDrops, Is.GreaterThanOrEqualTo(1));
+                    Assert.That(diagnostics.ReliableReceiveOverflowDisconnects, Is.Zero);
+                    Assert.That(diagnostics.Connections, Is.EqualTo(1));
+                    if (endpoint.TryReceive(out var queued))
+                        queued.Dispose();
+
+                }
+            }
+        }
+
+        [Test]
+        public void ReliableOverflowIsIsolatedToOnePeer()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 1;
+            settings.MaximumConnections = 2;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var firstClient = new LiteNetLibClientHost(settings))
+            {
+                var firstEndpoint = WaitForAccept(server, firstClient);
+                using (var secondClient = new LiteNetLibClientHost(settings))
+                {
+                    var secondEndpoint = WaitForAccept(server, secondClient);
+                    using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                    {
+                        Assert.That(firstClient.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, 32)), Is.True);
+                        Assert.That(firstClient.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
+                            PacketFlags.ReliableOrdered, 32)), Is.True);
+                        firstClient.Flush();
+
+                        Assert.That(secondClient.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, 32)), Is.True);
+                        secondClient.Flush();
+
+                        for (var i = 0; i < 800; i++)
+                        {
+                            firstClient.Update();
+                            firstClient.Flush();
+                            secondClient.Update();
+                            secondClient.Flush();
+                            server.Update();
+                            server.Flush();
+                            if (server.CaptureDiagnostics().ReliableReceiveOverflowDisconnects > 0)
+                                break;
+                            Thread.Sleep(1);
+                        }
+
+                        var isolated = WaitForReceive(server, secondClient, secondEndpoint);
+                        isolated.Dispose();
+                        Assert.That(server.CaptureDiagnostics().ReliableReceiveOverflowDisconnects,
+                            Is.GreaterThanOrEqualTo(1));
+                        Assert.That(server.CaptureDiagnostics().Connections, Is.EqualTo(1));
+                        Assert.That(server.TryDequeueDisconnected(out var disconnected),
+                            Is.True);
+                        Assert.That(disconnected.Value, Is.EqualTo(firstEndpoint.Connection.Value));
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public void DisconnectAndReconnectReclaimsQueuedReceiveLeases()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            {
+                var firstConnection = default(ConnectionId);
+                using (var firstClient = new LiteNetLibClientHost(settings))
+                {
+                    var firstEndpoint = WaitForAccept(server, firstClient);
+                    firstConnection = firstEndpoint.Connection;
+                    using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                    {
+                        Assert.That(firstClient.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, 32)), Is.True);
+                        for (var i = 0; i < 500; i++)
+                        {
+                            Pump(server, firstClient);
+                            if (server.CaptureDiagnostics().QueuedPackets > 0)
+                                break;
+                            Thread.Sleep(1);
+                        }
+                        Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(1));
+                        firstClient.Dispose();
+                        firstEndpoint.Dispose();
+
+                        for (var i = 0; i < 500; i++)
+                        {
+                            server.Update();
+                            server.Flush();
+                            if (server.CaptureDiagnostics().Connections == 0)
+                                break;
+                            Thread.Sleep(1);
+                        }
+
+                        Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                        Assert.That(server.CaptureDiagnostics().Connections, Is.Zero);
+
+                    }
+                }
+
+                using (var secondClient = new LiteNetLibClientHost(settings))
+                {
+                    var secondEndpoint = WaitForAccept(server, secondClient);
+                    Assert.That(secondEndpoint.Connection.Value, Is.GreaterThan(firstConnection.Value));
+                    using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                    {
+                        Assert.That(secondClient.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, 32)), Is.True);
+                        var packet = WaitForReceive(server, secondClient, secondEndpoint);
+                        packet.Dispose();
+                        WaitForDeliveryAtLeast(server, secondClient, 1);
+                        Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                        Assert.That(secondClient.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                    }
+                }
+            }
+        }
+        private static INetworkTransport WaitForNativeAccept(
+            LiteNetLibServerHost server, NativePeerHarness native)
+        {
+            INetworkTransport accepted = null;
+            for (var i = 0; i < 800; i++)
+            {
+                native.Pump();
+                server.Update();
+                server.Flush();
+                if (accepted == null)
+                    server.TryAccept(out accepted);
+                if (accepted != null && native.IsConnected)
+                    return accepted;
+                Thread.Sleep(1);
+            }
+            Assert.Fail("Native LiteNetLib peer was not accepted.");
+            return null;
+        }
+
+        private static void WaitForDeliveryAtLeast(
+            LiteNetLibServerHost server, LiteNetLibClientHost client, long callbacks)
+        {
+            for (var i = 0; i < 800; i++)
+            {
+                var diagnostics = client.CaptureDiagnostics();
+                if (diagnostics.NativeReliableBytes == 0 &&
+                    diagnostics.DeliveryCallbacks >= callbacks)
+                    return;
+                Pump(server, client);
+                Thread.Sleep(1);
+            }
+            Assert.Fail("LiteNetLib delivery callbacks did not drain reliable ownership.");
+        }
+
+        private sealed class NativePeerHarness : IDisposable
+        {
+            private readonly Native.EventBasedNetListener _listener;
+            private readonly Native.NetManager _manager;
+            private readonly Native.NetPeer _peer;
+
+            public NativePeerHarness(ushort port, int maxFragmentsCount)
+            {
+                _listener = new Native.EventBasedNetListener();
+                _listener.PeerConnectedEvent += peer => IsConnected = true;
+                _listener.PeerDisconnectedEvent += (peer, info) => IsConnected = false;
+                _manager = new Native.NetManager(_listener)
+                {
+                    AutoRecycle = true,
+                    ChannelsCount = 1,
+                    MtuOverride = LiteNetLibLimits.Mtu,
+                    MtuDiscovery = false,
+                    MaxFragmentsCount = checked((ushort)maxFragmentsCount),
+                    MaxPacketPerManualReceive = 256,
+                    UnsyncedEvents = false,
+                    UnsyncedReceiveEvent = false,
+                    UnsyncedDeliveryEvent = false
+                };
+                Assert.That(_manager.StartInManualMode(
+                    IPAddress.Loopback, IPAddress.IPv6Any, 0), Is.True);
+                _peer = _manager.Connect("127.0.0.1", port, string.Empty);
+                Assert.That(_peer, Is.Not.Null);
+            }
+
+            public bool IsConnected { get; private set; }
+
+            public void Pump()
+            {
+                if (_manager.IsRunning)
+                {
+                    _manager.PollEvents();
+                    _manager.ManualUpdate(1f);
+                }
+            }
+
+            public void Send(byte[] payload, Native.DeliveryMethod method)
+            {
+                Assert.That(_peer, Is.Not.Null);
+                _peer.Send(payload, 0, method);
+            }
+
+            public void Dispose()
+            {
+                if (_manager.IsRunning)
+                    _manager.Stop(false);
+            }
+        }
         private static NetworkBufferLease CreatePacket(NetworkBufferPool pool,
             PacketKind kind, PacketFlags flags, int payloadBytes, uint tick = PacketHeader.NoneTick)
         {
