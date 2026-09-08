@@ -101,7 +101,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         }
     }
 
-    /// <summary>Captures adapter counters without exposing LiteNetLib's native memory statistics.</summary>
+    /// <summary>Captures adapter counters and cumulative LiteNetLib native datagram statistics.</summary>
     public struct LiteNetLibDiagnostics
     {
         /// <summary>Number of active endpoint objects.</summary>
@@ -160,6 +160,16 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public long NativeReliableBytesHighWater;
         /// <summary>Native queue-only reliable packet count; this excludes in-flight window ownership.</summary>
         public int NativeReliableQueuePackets;
+        /// <summary>Cumulative native UDP datagrams sent during the host lifetime.</summary>
+        public long NativeSentPackets;
+        /// <summary>Cumulative native UDP datagrams received during the host lifetime.</summary>
+        public long NativeReceivedPackets;
+        /// <summary>Cumulative native UDP datagram payload bytes sent during the host lifetime.</summary>
+        public long NativeSentBytes;
+        /// <summary>Cumulative native UDP datagram payload bytes received during the host lifetime.</summary>
+        public long NativeReceivedBytes;
+        /// <summary>Cumulative LiteNetLib detected or retransmit packet loss during the host lifetime.</summary>
+        public long NativePacketLoss;
         /// <summary>Number of reliable delivery callbacks observed.</summary>
         public long DeliveryCallbacks;
         /// <summary>Number of reliable receive overflows that requested peer disconnect.</summary>
@@ -271,6 +281,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             var nativeListener = new Listener(this);
             _manager = new NetManager(nativeListener)
             {
+                EnableStatistics = true,
                 AutoRecycle = true,
                 ChannelsCount = 1,
                 MtuOverride = LiteNetLibLimits.Mtu,
@@ -722,6 +733,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 NativeReliableFragmentsHighWater = _nativeReliableFragmentsHighWater,
                 NativeReliableBytesHighWater = _nativeReliableBytesHighWater,
                 NativeReliableQueuePackets = nativeQueuePackets,
+                NativeSentPackets = _manager.Statistics.PacketsSent,
+                NativeReceivedPackets = _manager.Statistics.PacketsReceived,
+                NativeSentBytes = _manager.Statistics.BytesSent,
+                NativeReceivedBytes = _manager.Statistics.BytesReceived,
+                NativePacketLoss = _manager.Statistics.PacketLoss,
                 DeliveryCallbacks = _deliveryCallbacks,
                 ReliableReceiveOverflowDisconnects = _reliableReceiveOverflowDisconnects,
                 UnreliableReceiveDrops = _unreliableReceiveDrops,

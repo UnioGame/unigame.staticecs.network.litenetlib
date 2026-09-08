@@ -44,6 +44,12 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Is.EqualTo(LiteNetLibLimits.MaximumReliableBytes));
                 Assert.That(client.Endpoint.MaxUnreliablePayloadBytes,
                     Is.LessThanOrEqualTo(LiteNetLibLimits.MaximumSequencedBytes));
+                var nativeBeforeProtocol = client.CaptureDiagnostics();
+                Assert.That(nativeBeforeProtocol.NativeSentPackets, Is.GreaterThan(0));
+                Assert.That(nativeBeforeProtocol.NativeReceivedPackets, Is.GreaterThan(0));
+                Assert.That(nativeBeforeProtocol.NativeSentBytes, Is.GreaterThan(0));
+                Assert.That(nativeBeforeProtocol.NativeReceivedBytes, Is.GreaterThan(0));
+                Assert.That(nativeBeforeProtocol.NativePacketLoss, Is.GreaterThanOrEqualTo(0));
 
                 using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
                 {
@@ -76,6 +82,16 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                         PacketFlags.ReliableOrdered, 24);
                     receivedSnapshot.Dispose();
                     var diagnostics = client.CaptureDiagnostics();
+                    Assert.That(diagnostics.NativeSentPackets,
+                        Is.GreaterThanOrEqualTo(nativeBeforeProtocol.NativeSentPackets));
+                    Assert.That(diagnostics.NativeReceivedPackets,
+                        Is.GreaterThanOrEqualTo(nativeBeforeProtocol.NativeReceivedPackets));
+                    Assert.That(diagnostics.NativeSentBytes,
+                        Is.GreaterThanOrEqualTo(nativeBeforeProtocol.NativeSentBytes));
+                    Assert.That(diagnostics.NativeReceivedBytes,
+                        Is.GreaterThanOrEqualTo(nativeBeforeProtocol.NativeReceivedBytes));
+                    Assert.That(diagnostics.NativePacketLoss,
+                        Is.GreaterThanOrEqualTo(nativeBeforeProtocol.NativePacketLoss));
                     Assert.That(diagnostics.ReliableSentPackets, Is.GreaterThanOrEqualTo(2));
                     Assert.That(diagnostics.UnreliableSentPackets, Is.GreaterThanOrEqualTo(1));
                     Assert.That(diagnostics.NativeReliableBytes, Is.EqualTo(0));
