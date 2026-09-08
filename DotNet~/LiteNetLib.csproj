@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>UniGame.StaticEcs.Network.LiteNetLib</AssemblyName>
+    <RootNamespace>UniGame.StaticEcs.Network.LiteNetLib</RootNamespace>
+    <NetworkCoreProject Condition="'$(NetworkCoreProject)' == ''">../../../../tools/network-load/Portable/Network/Network.csproj</NetworkCoreProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(NetworkCoreProject)" />
+    <PackageReference Include="LiteNetLib" Version="2.1.4" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../Runtime/LiteNetLibTransport.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,11 @@
+{
+  "name": "com.unigame.staticecs.network.litenetlib",
+  "displayName": "UniGame Static ECS Network LiteNetLib",
+  "version": "2026.8.0",
+  "unity": "6000.0",
+  "description": "LiteNetLib 2.1.4 adapter for the transport-neutral Static ECS network protocol.",
+  "dependencies": {
+    "com.unigame.staticecs.network": "2026.6.0",
+    "com.revenantx.litenetlib": "1.0.1-1"
+  }
+}

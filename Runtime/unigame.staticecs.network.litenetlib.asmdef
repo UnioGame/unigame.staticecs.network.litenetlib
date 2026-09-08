@@ -1,0 +1,14 @@
+{
+  "name": "unigame.staticecs.network.litenetlib",
+  "rootNamespace": "UniGame.StaticEcs.Network.LiteNetLib",
+  "references": [
+    "unigame.staticecs.network",
+    "unigame.staticecs.network.protocol",
+    "LiteNetLib"
+  ],
+  "autoReferenced": true,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "allowUnsafeCode": false,
+  "noEngineReferences": true
+}

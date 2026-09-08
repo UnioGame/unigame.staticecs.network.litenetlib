@@ -1,0 +1,20 @@
+{
+  "name": "unigame.staticecs.network.litenetlib.tests",
+  "rootNamespace": "UniGame.StaticEcs.Network.LiteNetLib.Tests",
+  "references": [
+    "unigame.staticecs.network.litenetlib",
+    "unigame.staticecs.network.protocol",
+    "unigame.staticecs.network",
+    "LiteNetLib"
+  ],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "noEngineReferences": false
+}
