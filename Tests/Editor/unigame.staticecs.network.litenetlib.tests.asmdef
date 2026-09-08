@@ -6,14 +6,20 @@
     "unigame.staticecs.network.protocol",
     "unigame.staticecs.network"
   ],
-  "includePlatforms": ["Editor"],
+  "includePlatforms": [
+    "Editor"
+  ],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
-  "overrideReferences": false,
-  "precompiledReferences": [],
+  "overrideReferences": true,
+  "precompiledReferences": [
+    "LiteNetLib.dll"
+  ],
   "autoReferenced": true,
   "defineConstraints": [],
   "versionDefines": [],
-  "optionalUnityReferences": ["TestAssemblies"],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
   "noEngineReferences": false
 }
