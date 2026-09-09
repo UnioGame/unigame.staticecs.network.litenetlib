@@ -294,12 +294,19 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             };
             try
             {
-                var address = ParseAddress(settings.Address, listener);
-                var ipv4 = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
-                    ? address : IPAddress.Any;
-                var ipv6 = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
-                    ? address : IPAddress.IPv6Any;
-                if (!_manager.StartInManualMode(ipv4, ipv6, listener ? settings.Port : 0))
+                var ipv4 = IPAddress.Any;
+                var ipv6 = IPAddress.IPv6Any;
+                var port = 0;
+                if (listener)
+                {
+                    var address = ParseAddress(settings.Address, true);
+                    ipv4 = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                        ? address : IPAddress.Any;
+                    ipv6 = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+                        ? address : IPAddress.IPv6Any;
+                    port = settings.Port;
+                }
+                if (!_manager.StartInManualMode(ipv4, ipv6, port))
                     throw new InvalidOperationException("Unable to start LiteNetLib manual mode.");
                 if (!listener)
                 {

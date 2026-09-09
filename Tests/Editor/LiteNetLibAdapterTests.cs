@@ -26,6 +26,38 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
+        public void NonlocalClientDestinationUsesEphemeralLocalSocket()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "192.0.2.1";
+            settings.Port = 7777;
+
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                Assert.That(client.Endpoint, Is.Not.Null);
+                Assert.That(client.Connected, Is.False);
+            }
+        }
+
+        [Test]
+        public void ListenerStillRejectsUnavailableNonlocalBind()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "192.0.2.1";
+            settings.Port = FindFreePort();
+            LiteNetLibServerHost server = null;
+
+            try
+            {
+                Assert.That(() => server = new LiteNetLibServerHost(settings), Throws.Exception);
+            }
+            finally
+            {
+                server?.Dispose();
+            }
+        }
+
+        [Test]
         public void NativeLoopbackDeliversSequencedAndReliablePackets()
         {
             var port = FindFreePort();
