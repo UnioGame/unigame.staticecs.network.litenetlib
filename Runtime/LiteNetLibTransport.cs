@@ -333,12 +333,14 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal void Update()
         {
             ThrowIfDisposed();
+            using var nativeScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.NativeUpdate);
             _manager.PollEvents();
         }
 
         internal void Flush()
         {
             ThrowIfDisposed();
+            using var drainScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.ReliableDrain);
             foreach (var endpoint in _endpoints.Values)
                 endpoint.DrainReliable();
             var now = _clock.ElapsedTicks;
@@ -346,6 +348,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _lastPumpTicks = now;
             if (elapsed <= 0)
                 elapsed = 0.001f;
+            using var nativeScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.NativeUpdate);
             _manager.ManualUpdate(elapsed);
         }
 
@@ -588,6 +591,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal void OnReceive(NetPeer peer, NetPacketReader reader,
             byte channelNumber, DeliveryMethod deliveryMethod)
         {
+            using var receiveScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.ReceiveCallback);
             if (!_endpoints.TryGetValue(peer, out var endpoint) || endpoint.IsDisposed)
                 return;
             var reliable = deliveryMethod == DeliveryMethod.ReliableOrdered;
