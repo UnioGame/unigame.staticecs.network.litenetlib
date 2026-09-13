@@ -745,6 +745,403 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 }
             }
         }
+
+        [Test]
+        public void RepeatedReliableSendsReachWarmTicketReuseSteadyState()
+        {
+            const int WarmCount = 64;
+            const int PayloadBytes = 32;
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = WarmCount + 8;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var driver = client.Driver;
+                    var firstCallbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                    var accepted = SendReliableBurst(client, pool, WarmCount, PayloadBytes, null);
+                    Assert.That(accepted, Is.EqualTo(WarmCount));
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(WarmCount));
+                    DrainReliableBurst(server, client, serverEndpoint, WarmCount,
+                        firstCallbacks + WarmCount);
+                    Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(WarmCount));
+                    Assert.That(driver.DeliveryTicketsReused, Is.Zero);
+
+                    var secondCallbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                    SendReliableBurst(client, pool, WarmCount, PayloadBytes, null);
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(WarmCount),
+                        "Warm reuse must not allocate new delivery tickets.");
+                    DrainReliableBurst(server, client, serverEndpoint, WarmCount,
+                        secondCallbacks + WarmCount);
+
+                    Assert.That(driver.DeliveryTicketsReused, Is.EqualTo(WarmCount));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(WarmCount));
+                    Assert.That(driver.DeliveryTicketsRetained,
+                        Is.LessThanOrEqualTo(LiteNetLibDriver.DeliveryTicketPoolCapacity));
+                    Assert.That(client.CaptureDiagnostics().NativeReliableBytes, Is.Zero);
+                    serverEndpoint.Dispose();
+                }
+            }
+        }
+
+        [Test]
+        public void DeliveryTicketReuseCrossesEndpointsAndResetsAccounting()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 16;
+            settings.MaximumConnections = 2;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var clientA = new LiteNetLibClientHost(settings))
+            {
+                var endpointA = WaitForAccept(server, clientA);
+                using (var clientB = new LiteNetLibClientHost(settings))
+                {
+                    var endpointB = WaitForAcceptPair(server, clientA, clientB);
+                    Assert.That(endpointA, Is.Not.SameAs(endpointB));
+                    var endpointANative = (LiteNetLibEndpoint)endpointA;
+                    var endpointBNative = (LiteNetLibEndpoint)endpointB;
+                    var driver = server.Driver;
+                    using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                    {
+                        var callbacks = server.CaptureDiagnostics().DeliveryCallbacks;
+                        Assert.That(endpointA.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, 32)), Is.True);
+                        WaitForServerDelivery(server, clientA, callbacks + 1);
+                        Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1));
+                        Assert.That(driver.DeliveryTicketsReused, Is.Zero);
+                        Assert.That(endpointANative.NativeReliableFragments, Is.Zero);
+                        Assert.That(endpointANative.NativeReliableBytes, Is.Zero);
+
+                        callbacks = server.CaptureDiagnostics().DeliveryCallbacks;
+                        Assert.That(endpointB.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                            PacketFlags.ReliableOrdered, 60000, 40)), Is.True);
+                        WaitForServerDelivery(server, clientB, callbacks + 1);
+                        Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1),
+                            "Cross-endpoint reuse must not allocate a new ticket.");
+                        Assert.That(driver.DeliveryTicketsReused, Is.GreaterThanOrEqualTo(1));
+                        Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(1));
+                        Assert.That(endpointANative.NativeReliableFragments, Is.Zero);
+                        Assert.That(endpointANative.NativeReliableBytes, Is.Zero);
+                        Assert.That(endpointBNative.NativeReliableFragments, Is.Zero);
+                        Assert.That(endpointBNative.NativeReliableBytes, Is.Zero);
+
+                        callbacks = server.CaptureDiagnostics().DeliveryCallbacks;
+                        Assert.That(endpointB.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, 32)), Is.True);
+                        WaitForServerDelivery(server, clientB, callbacks + 1);
+                        Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1));
+                        Assert.That(driver.DeliveryTicketsReused, Is.GreaterThanOrEqualTo(2));
+                        Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(1));
+                        Assert.That(endpointANative.NativeReliableFragments, Is.Zero);
+                        Assert.That(endpointANative.NativeReliableBytes, Is.Zero);
+                        Assert.That(server.CaptureDiagnostics().NativeReliableBytes, Is.Zero);
+                        Assert.That(server.CaptureDiagnostics().NativeReliableFragments, Is.Zero);
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public void DuplicateDeliveryCallbackBeforeReuseDoesNotDoubleEnqueue()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                WaitForAccept(server, client);
+                var clientEndpoint = (LiteNetLibEndpoint)client.Endpoint;
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out var ticket), Is.True);
+
+                    driver.OnDelivery(null, ticket);
+                    driver.OnDelivery(null, ticket);
+
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(1),
+                        "A duplicate callback must not enqueue the ticket twice.");
+                    Assert.That(driver.DeliveryTicketsReused, Is.Zero);
+                    Assert.That(clientEndpoint.NativeReliableFragments, Is.Zero);
+                    Assert.That(clientEndpoint.NativeReliableBytes, Is.Zero);
+
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(driver.DeliveryTicketsReused, Is.EqualTo(1));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out var reused), Is.True);
+                    Assert.That(reused, Is.SameAs(ticket));
+                }
+            }
+        }
+
+        [Test]
+        public void LateDeliveryCallbackAfterInjectedSendFailureIsHarmless()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                WaitForAccept(server, client);
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    driver.ThrowOnNextReliableSubmit = true;
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.False);
+
+                    var retired = driver.LastRetiredDeliveryTicket;
+                    Assert.That(retired, Is.Not.Null);
+                    Assert.That(retired.State,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+                    Assert.That(driver.ContainsRetainedDeliveryTicket(retired), Is.False);
+
+                    driver.OnDelivery(null, retired);
+                    driver.OnDelivery(null, retired);
+
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+                    Assert.That(driver.ContainsRetainedDeliveryTicket(retired), Is.False);
+                    Assert.That(retired.Retire(), Is.False);
+                    Assert.That(driver.DeliveryTicketsReused, Is.Zero);
+                    Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void LateDeliveryCallbackAfterDisconnectAndDisposeIsHarmless()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                var clientEndpoint = (LiteNetLibEndpoint)client.Endpoint;
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out var ticket), Is.True);
+
+                    serverEndpoint.Dispose();
+                    WaitForEndpointDisposed(server, client, clientEndpoint);
+
+                    Assert.That(ticket.State,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
+                    driver.OnDelivery(null, ticket);
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+                    Assert.That(driver.ContainsRetainedDeliveryTicket(ticket), Is.False);
+                }
+            }
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                WaitForAccept(server, client);
+                var clientEndpoint = (LiteNetLibEndpoint)client.Endpoint;
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out var ticket), Is.True);
+
+                    client.Endpoint.Dispose();
+
+                    Assert.That(ticket.State,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
+                    driver.OnDelivery(null, ticket);
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+                    Assert.That(driver.ContainsRetainedDeliveryTicket(ticket), Is.False);
+                }
+            }
+
+            using (var server = new LiteNetLibServerHost(settings))
+            {
+                var client = new LiteNetLibClientHost(settings);
+                WaitForAccept(server, client);
+                var clientEndpoint = (LiteNetLibEndpoint)client.Endpoint;
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out var ticket), Is.True);
+
+                    client.Dispose();
+
+                    Assert.That(ticket.State,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
+                    driver.OnDelivery(null, ticket);
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+                    Assert.That(driver.ContainsRetainedDeliveryTicket(ticket), Is.False);
+                }
+                client.Dispose();
+            }
+        }
+
+        [Test]
+        public void FragmentedReliableDeliveryCompletesTicketAccountingExactlyOnce()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 8;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                var clientEndpoint = (LiteNetLibEndpoint)client.Endpoint;
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var callbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                        PacketFlags.ReliableOrdered, 60000, 20)), Is.True);
+
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out var ticket), Is.True);
+                    Assert.That(ticket.Fragments, Is.GreaterThan(1));
+                    Assert.That(ticket.Snapshot, Is.True);
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+
+                    client.Update();
+                    client.Flush();
+                    Assert.That(clientEndpoint.NativeReliableFragments, Is.GreaterThan(1));
+                    Assert.That(clientEndpoint.NativeReliableBytes, Is.GreaterThan(60000));
+
+                    var received = WaitForReceive(server, client, serverEndpoint);
+                    received.Dispose();
+                    WaitForDeliveryAtLeast(server, client, callbacks + 1);
+
+                    var complete = client.CaptureDiagnostics();
+                    Assert.That(complete.NativeReliableFragments, Is.Zero);
+                    Assert.That(complete.NativeReliableBytes, Is.Zero);
+                    Assert.That(complete.DeliveryCallbacks - callbacks, Is.EqualTo(1));
+                    Assert.That(clientEndpoint.NativeReliableFragments, Is.Zero);
+                    Assert.That(clientEndpoint.NativeReliableBytes, Is.Zero);
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(1));
+                    Assert.That(ticket.CompleteByCallback(), Is.False,
+                        "A completed ticket must not complete twice.");
+                }
+            }
+        }
+
+        [Test]
+        public void ReliableBurstAbovePoolCapacityBoundsRetentionAndAcceptance()
+        {
+            const int BurstCount = 4200;
+            const int PayloadBytes = 32;
+            var packetBytes = PacketHeader.Size + PayloadBytes;
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = BurstCount + 64;
+            settings.NativeReliableFragmentsCapacity = BurstCount + 64;
+            settings.NativeReliableBytesCapacity = packetBytes * (long)(BurstCount + 64);
+            settings.ReliableSendQueueCapacity = BurstCount + 64;
+            settings.ReliableSendBytesCapacity = packetBytes * (long)(BurstCount + 64);
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(LiteNetLibDriver.DeliveryTicketPoolCapacity, Is.EqualTo(4096));
+                    var callbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                    var accepted = SendReliableBurst(client, pool, BurstCount, PayloadBytes, null);
+                    Assert.That(accepted, Is.EqualTo(BurstCount));
+                    Assert.That(client.CaptureDiagnostics().SendFailures, Is.Zero);
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(BurstCount));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+
+                    DrainReliableBurst(server, client, serverEndpoint, BurstCount,
+                        callbacks + BurstCount);
+
+                    Assert.That(driver.DeliveryTicketsRetained,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketPoolCapacity));
+                    Assert.That(driver.DeliveryTicketsCreated,
+                        Is.GreaterThan(LiteNetLibDriver.DeliveryTicketPoolCapacity));
+                    Assert.That(driver.DeliveryTicketsDiscarded,
+                        Is.EqualTo(BurstCount - LiteNetLibDriver.DeliveryTicketPoolCapacity));
+
+                    var afterCallbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, PayloadBytes)), Is.True);
+                    Assert.That(driver.DeliveryTicketsReused, Is.EqualTo(1));
+                    Assert.That(driver.DeliveryTicketsRetained,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketPoolCapacity - 1));
+                    DrainReliableBurst(server, client, serverEndpoint, 1,
+                        afterCallbacks + 1);
+                    Assert.That(driver.DeliveryTicketsRetained,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketPoolCapacity));
+                }
+            }
+        }
+
+        [Test]
+        public void DriverDisposeClearsRetainedDeliveryTickets()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 16;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            {
+                var client = new LiteNetLibClientHost(settings);
+                var serverEndpoint = WaitForAccept(server, client);
+                var driver = client.Driver;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var callbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                    SendReliableBurst(client, pool, 8, 32, null);
+                    DrainReliableBurst(server, client, serverEndpoint, 8, callbacks + 8);
+                    Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(8));
+
+                    client.Dispose();
+
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(8));
+                    Assert.That(driver.DeliveryTicketsDiscarded, Is.Zero);
+                }
+                client.Dispose();
+            }
+        }
+
         private static INetworkTransport WaitForNativeAccept(
             LiteNetLibServerHost server, NativePeerHarness native)
         {
@@ -967,6 +1364,53 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             }
             Assert.Fail("LiteNetLib loopback connection was not accepted.");
             return null;
+        }
+
+        private static INetworkTransport WaitForAcceptPair(LiteNetLibServerHost server,
+            LiteNetLibClientHost first, LiteNetLibClientHost second)
+        {
+            INetworkTransport accepted = null;
+            for (var i = 0; i < 400; i++)
+            {
+                Pump(server, first);
+                second.Update();
+                second.Flush();
+                if (accepted == null)
+                    server.TryAccept(out accepted);
+                if (accepted != null && first.Connected && second.Connected)
+                    return accepted;
+                Thread.Sleep(1);
+            }
+            Assert.Fail("The second LiteNetLib loopback connection was not accepted.");
+            return null;
+        }
+
+        private static void WaitForServerDelivery(LiteNetLibServerHost server,
+            LiteNetLibClientHost client, long callbacks)
+        {
+            for (var i = 0; i < 800; i++)
+            {
+                var diagnostics = server.CaptureDiagnostics();
+                if (diagnostics.NativeReliableBytes == 0 &&
+                    diagnostics.DeliveryCallbacks >= callbacks)
+                    return;
+                Pump(server, client);
+                Thread.Sleep(1);
+            }
+            Assert.Fail("LiteNetLib server delivery callbacks did not drain reliable ownership.");
+        }
+
+        private static void WaitForEndpointDisposed(LiteNetLibServerHost server,
+            LiteNetLibClientHost client, LiteNetLibEndpoint endpoint)
+        {
+            for (var i = 0; i < 800; i++)
+            {
+                if (endpoint.IsDisposed)
+                    return;
+                Pump(server, client);
+                Thread.Sleep(1);
+            }
+            Assert.Fail("LiteNetLib endpoint was not disposed after disconnect.");
         }
 
         private static NetworkBufferLease WaitForReceive(LiteNetLibServerHost server,

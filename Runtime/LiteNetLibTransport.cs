@@ -5,6 +5,9 @@ using System.Net;
 using UniGame.StaticEcs.Network;
 using global::LiteNetLib;
 
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("unigame.staticecs.network.litenetlib.tests")]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Adapter.Tests")]
+
 namespace UniGame.StaticEcs.Network.LiteNetLib
 {
     /// <summary>Defines the fixed LiteNetLib packet and fragmentation limits.</summary>
@@ -225,6 +228,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public void Flush() => _driver.Flush();
         /// <summary>Captures adapter and pool counters.</summary>
         public LiteNetLibDiagnostics CaptureDiagnostics() => _driver.CaptureDiagnostics();
+        internal LiteNetLibDriver Driver => _driver;
         /// <inheritdoc />
         public void Dispose() => _driver.Dispose();
     }
@@ -251,6 +255,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public void Flush() => _driver.Flush();
         /// <summary>Captures adapter and pool counters.</summary>
         public LiteNetLibDiagnostics CaptureDiagnostics() => _driver.CaptureDiagnostics();
+        internal LiteNetLibDriver Driver => _driver;
         /// <inheritdoc />
         public void Dispose() => _driver.Dispose();
     }
@@ -297,6 +302,25 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private long _nativeReliableBytesHighWater;
         private int _nativePacketPoolLowWater = -1;
         private bool _nativePacketPoolObserved;
+        private readonly Queue<DeliveryTicket> _deliveryTickets = new Queue<DeliveryTicket>();
+        private int _deliveryTicketsCreated;
+        private int _deliveryTicketsRented;
+        private int _deliveryTicketsReused;
+        private int _deliveryTicketsDiscarded;
+
+        internal const int DeliveryTicketPoolCapacity = 4096;
+
+        internal int DeliveryTicketsCreated => _deliveryTicketsCreated;
+        internal int DeliveryTicketsRented => _deliveryTicketsRented;
+        internal int DeliveryTicketsReused => _deliveryTicketsReused;
+        internal int DeliveryTicketsDiscarded => _deliveryTicketsDiscarded;
+        internal int DeliveryTicketsRetained => _deliveryTickets.Count;
+
+        internal bool ThrowOnNextReliableSubmit { get; set; }
+        internal DeliveryTicket LastRetiredDeliveryTicket { get; private set; }
+
+        internal bool ContainsRetainedDeliveryTicket(DeliveryTicket ticket) =>
+            _deliveryTickets.Contains(ticket);
 
         internal LiteNetLibDriver(LiteNetLibSettings settings, bool listener)
         {
@@ -503,10 +527,15 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 endpoint.TrackSnapshot(header);
             try
             {
-                ticket = new DeliveryTicket(endpoint, fragments, packet.Length,
+                ticket = RentDeliveryTicket(endpoint, fragments, packet.Length,
                     header.Kind == PacketKind.SnapshotChunk);
                 endpoint.TrackTicket(ticket);
                 RegisterNative(ticket);
+                if (ThrowOnNextReliableSubmit)
+                {
+                    ThrowOnNextReliableSubmit = false;
+                    throw new InvalidOperationException("Injected reliable submit failure.");
+                }
                 endpoint.Peer.SendWithDeliveryEvent(packet.Span, DeliveryMethod.ReliableOrdered, ticket);
                 ObserveNativePacketPool();
                 _sent++;
@@ -516,7 +545,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             }
             catch
             {
-                ticket?.Complete();
+                ticket?.Retire();
                 RejectSend();
                 return false;
             }
@@ -524,6 +553,40 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             {
                 packet.Dispose();
             }
+        }
+
+        private DeliveryTicket RentDeliveryTicket(LiteNetLibEndpoint endpoint,
+            int fragments, int bytes, bool snapshot)
+        {
+            DeliveryTicket ticket;
+            if (_deliveryTickets.Count > 0)
+            {
+                ticket = _deliveryTickets.Dequeue();
+                _deliveryTicketsReused++;
+            }
+            else
+            {
+                ticket = new DeliveryTicket(this);
+                _deliveryTicketsCreated++;
+            }
+            _deliveryTicketsRented++;
+            ticket.Reset(endpoint, fragments, bytes, snapshot);
+            return ticket;
+        }
+
+        internal void ReturnDeliveryTicket(DeliveryTicket ticket)
+        {
+            if (_disposed || _deliveryTickets.Count >= DeliveryTicketPoolCapacity)
+            {
+                _deliveryTicketsDiscarded++;
+                return;
+            }
+            _deliveryTickets.Enqueue(ticket);
+        }
+
+        internal void MarkTicketRetired(DeliveryTicket ticket)
+        {
+            LastRetiredDeliveryTicket = ticket;
         }
 
         private static int FragmentCount(int bytes) =>
@@ -683,7 +746,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         {
             if (userData is DeliveryTicket ticket)
             {
-                ticket.Complete();
+                ticket.CompleteByCallback();
                 _deliveryCallbacks++;
             }
         }
@@ -816,6 +879,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _endpoints.Clear();
             _accepted.Clear();
             _disconnected.Clear();
+            _deliveryTickets.Clear();
+            LastRetiredDeliveryTicket = null;
             _manager.Stop(false);
             _pool.Dispose();
         }
@@ -850,29 +915,61 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             public void OnMessageDelivered(NetPeer peer, object userData) => _owner.OnDelivery(peer, userData);
         }
 
+        internal enum DeliveryTicketState
+        {
+            Active = 0,
+            CompletedByCallback = 1,
+            Retired = 2,
+        }
+
         internal sealed class DeliveryTicket
         {
-            private readonly LiteNetLibEndpoint _endpoint;
-            private int _completed;
+            private readonly LiteNetLibDriver _driver;
+            private LiteNetLibEndpoint _endpoint;
+            private int _state;
 
-            public DeliveryTicket(LiteNetLibEndpoint endpoint, int fragments, int bytes, bool snapshot)
+            internal DeliveryTicket(LiteNetLibDriver driver)
+            {
+                _driver = driver;
+                _state = (int)DeliveryTicketState.Active;
+            }
+
+            internal LiteNetLibEndpoint Endpoint => _endpoint;
+            public int Fragments { get; private set; }
+            public int Bytes { get; private set; }
+            public bool Snapshot { get; private set; }
+            internal DeliveryTicketState State => (DeliveryTicketState)_state;
+
+            internal void Reset(LiteNetLibEndpoint endpoint,
+                int fragments, int bytes, bool snapshot)
             {
                 _endpoint = endpoint;
                 Fragments = fragments;
                 Bytes = bytes;
                 Snapshot = snapshot;
+                _state = (int)DeliveryTicketState.Active;
             }
 
-            internal LiteNetLibEndpoint Endpoint => _endpoint;
-            public int Fragments { get; }
-            public int Bytes { get; }
-            public bool Snapshot { get; }
-
-            public void Complete()
+            internal bool CompleteByCallback()
             {
-                if (System.Threading.Interlocked.Exchange(ref _completed, 1) != 0)
-                    return;
+                if (System.Threading.Interlocked.CompareExchange(ref _state,
+                        (int)DeliveryTicketState.CompletedByCallback,
+                        (int)DeliveryTicketState.Active) != (int)DeliveryTicketState.Active)
+                    return false;
                 _endpoint.CompleteTicket(this);
+                _driver.ReturnDeliveryTicket(this);
+                return true;
+            }
+
+            internal bool Retire()
+            {
+                if (System.Threading.Interlocked.CompareExchange(ref _state,
+                        (int)DeliveryTicketState.Retired,
+                        (int)DeliveryTicketState.Active) != (int)DeliveryTicketState.Active)
+                    return false;
+                _driver.MarkTicketRetired(this);
+                _endpoint.CompleteTicket(this);
+                return true;
             }
         }
     }
@@ -1004,6 +1101,17 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         internal void TrackTicket(LiteNetLibDriver.DeliveryTicket ticket) => _tickets.Add(ticket);
 
+        internal bool TryGetActiveTicket(out LiteNetLibDriver.DeliveryTicket ticket)
+        {
+            foreach (var candidate in _tickets)
+            {
+                ticket = candidate;
+                return true;
+            }
+            ticket = null;
+            return false;
+        }
+
         internal void CompleteTicket(LiteNetLibDriver.DeliveryTicket ticket)
         {
             if (!_tickets.Remove(ticket))
@@ -1054,7 +1162,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             {
                 var tickets = new List<LiteNetLibDriver.DeliveryTicket>(_tickets);
                 foreach (var ticket in tickets)
-                    ticket.Complete();
+                    ticket.Retire();
             }
             _pendingSnapshotChunks = 0;
             _pendingSnapshotTick = 0;
