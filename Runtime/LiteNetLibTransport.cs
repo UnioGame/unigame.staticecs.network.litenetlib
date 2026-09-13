@@ -268,6 +268,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private readonly NetManager _manager;
         private readonly Dictionary<NetPeer, LiteNetLibEndpoint> _endpoints =
             new Dictionary<NetPeer, LiteNetLibEndpoint>();
+        private readonly List<LiteNetLibEndpoint> _drainOrder;
         private readonly Queue<LiteNetLibEndpoint> _accepted = new Queue<LiteNetLibEndpoint>();
         private readonly Queue<ConnectionId> _disconnected = new Queue<ConnectionId>();
         private readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -302,6 +303,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private long _nativeReliableBytesHighWater;
         private int _nativePacketPoolLowWater = -1;
         private bool _nativePacketPoolObserved;
+        private readonly int _nativeFragmentAdmissionBudget;
+        private int _drainCursor;
         private readonly Queue<DeliveryTicket> _deliveryTickets = new Queue<DeliveryTicket>();
         private int _deliveryTicketsCreated;
         private int _deliveryTicketsRented;
@@ -316,6 +319,18 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal int DeliveryTicketsDiscarded => _deliveryTicketsDiscarded;
         internal int DeliveryTicketsRetained => _deliveryTickets.Count;
 
+        internal int NativeFragmentAdmissionBudget => _nativeFragmentAdmissionBudget;
+
+        /// <summary>Computes the driver-wide native fragment admission budget for a packet pool.</summary>
+        internal static int ComputeNativeFragmentAdmissionBudget(int nativePacketPoolSize)
+        {
+            if (nativePacketPoolSize <= 0)
+                return LiteNetLibLimits.MaximumFragmentsCount;
+            var scaled = (int)Math.Min(int.MaxValue, nativePacketPoolSize * 3L / 4L);
+            return Math.Min(nativePacketPoolSize,
+                Math.Max(LiteNetLibLimits.MaximumFragmentsCount, scaled));
+        }
+
         internal bool ThrowOnNextReliableSubmit { get; set; }
 
         internal bool ContainsRetainedDeliveryTicket(DeliveryTicket ticket) =>
@@ -325,6 +340,12 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         {
             _settings = settings;
             _listener = listener;
+            _nativeFragmentAdmissionBudget =
+                ComputeNativeFragmentAdmissionBudget(settings.NativePacketPoolSize);
+            var drainCapacity = settings.MaximumConnections <= 0
+                ? 1
+                : (int)Math.Min((long)settings.MaximumConnections + 1L, 4096L);
+            _drainOrder = new List<LiteNetLibEndpoint>(drainCapacity);
             _pool = new NetworkBufferPool(listener
                 ? NetworkBufferPool.DefaultServerRetainedBytes
                 : NetworkBufferPool.DefaultClientRetainedBytes);
@@ -366,6 +387,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                         throw new InvalidOperationException("Unable to create a LiteNetLib connection.");
                     _clientEndpoint = CreateEndpoint(peer, new ConnectionId(1));
                     _endpoints.Add(peer, _clientEndpoint);
+                    _drainOrder.Add(_clientEndpoint);
                 }
                 _lastPumpTicks = _clock.ElapsedTicks;
             }
@@ -393,8 +415,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         {
             ThrowIfDisposed();
             using var drainScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.ReliableDrain);
-            foreach (var endpoint in _endpoints.Values)
-                endpoint.DrainReliable();
+            DrainReliableEndpoints();
             var now = _clock.ElapsedTicks;
             var elapsed = (float)((now - _lastPumpTicks) * 1000.0 / Stopwatch.Frequency);
             _lastPumpTicks = now;
@@ -587,7 +608,50 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             (bytes + LiteNetLibLimits.ReliableFragmentPayloadBytes - 1) /
             LiteNetLibLimits.ReliableFragmentPayloadBytes;
 
+        private void DrainReliableEndpoints()
+        {
+            var count = _drainOrder.Count;
+            while (count > 0)
+            {
+                var progress = false;
+                for (var visit = 0; visit < count; visit++)
+                {
+                    if (_drainOrder.Count == 0)
+                        break;
+                    if (_drainCursor >= _drainOrder.Count)
+                        _drainCursor = 0;
+                    var endpoint = _drainOrder[_drainCursor];
+                    _drainCursor++;
+                    if (endpoint.DrainOneReliable())
+                        progress = true;
+                }
+                if (!progress)
+                    break;
+                count = _drainOrder.Count;
+            }
+            if (_drainOrder.Count == 0)
+                _drainCursor = 0;
+        }
+
+        private void RemoveFromDrainOrder(LiteNetLibEndpoint endpoint)
+        {
+            for (var i = 0; i < _drainOrder.Count; i++)
+            {
+                if (!ReferenceEquals(_drainOrder[i], endpoint))
+                    continue;
+                _drainOrder.RemoveAt(i);
+                if (i < _drainCursor)
+                    _drainCursor--;
+                if (_drainCursor < 0)
+                    _drainCursor = 0;
+                if (_drainCursor >= _drainOrder.Count)
+                    _drainCursor = 0;
+                return;
+            }
+        }
+
         internal bool CanRegisterNative(LiteNetLibEndpoint endpoint, int fragments, int bytes) =>
+            _nativeReliableFragments <= _nativeFragmentAdmissionBudget - fragments &&
             endpoint.NativeReliableFragments <= _settings.NativeReliableFragmentsCapacity - fragments &&
             endpoint.NativeReliableBytes <= _settings.NativeReliableBytesCapacity - bytes;
 
@@ -648,6 +712,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             var endpoint = CreateEndpoint(peer, new ConnectionId(++_nextConnection));
             endpoint.MarkConnected();
             _endpoints.Add(peer, endpoint);
+            _drainOrder.Add(endpoint);
             _accepted.Enqueue(endpoint);
         }
 
@@ -668,6 +733,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             {
                 endpoint.CloseFromDriver();
                 _endpoints.Remove(peer);
+                RemoveFromDrainOrder(endpoint);
                 _disconnects++;
                 if (_disconnected.Count < _settings.MaximumConnections)
                     _disconnected.Enqueue(endpoint.Connection);
@@ -750,6 +816,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             if (endpoint.IsDisposed)
                 return;
             endpoint.MarkDisposed();
+            RemoveFromDrainOrder(endpoint);
             if (endpoint.Peer != null && endpoint.Peer.ConnectionState != ConnectionState.Disconnected)
                 endpoint.Peer.Disconnect();
         }
@@ -871,6 +938,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             foreach (var endpoint in _endpoints.Values)
                 endpoint.CloseFromDriver();
             _endpoints.Clear();
+            _drainOrder.Clear();
+            _drainCursor = 0;
             _accepted.Clear();
             _disconnected.Clear();
             _deliveryTickets.Clear();
@@ -1076,17 +1145,17 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             return true;
         }
 
-        internal void DrainReliable()
+        internal bool DrainOneReliable()
         {
-            while (!_disposed && _pendingReliable.Count > 0)
-            {
-                var next = _pendingReliable.Peek();
-                if (!_owner.CanRegisterNative(this, next.Fragments, next.Packet.Length))
-                    return;
-                _pendingReliable.Dequeue();
-                _pendingReliableBytes -= next.Packet.Length;
-                _owner.SubmitQueuedReliable(this, next.Packet, next.Header, next.Fragments);
-            }
+            if (_disposed || _pendingReliable.Count == 0)
+                return false;
+            var next = _pendingReliable.Peek();
+            if (!_owner.CanRegisterNative(this, next.Fragments, next.Packet.Length))
+                return false;
+            _pendingReliable.Dequeue();
+            _pendingReliableBytes -= next.Packet.Length;
+            _owner.SubmitQueuedReliable(this, next.Packet, next.Header, next.Fragments);
+            return true;
         }
 
         internal void RegisterNative(LiteNetLibDriver.DeliveryTicket ticket)
