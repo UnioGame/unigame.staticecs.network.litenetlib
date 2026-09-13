@@ -46,6 +46,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public int MaximumUnreliableBytes;
         /// <summary>Maximum queued received packets per connection.</summary>
         public int ReceiveQueueCapacity;
+        /// <summary>Maximum packets a host may process per update; zero selects an automatic budget.</summary>
+        public int MaximumPacketsPerUpdate;
         /// <summary>Maximum accepted server connections.</summary>
         public int MaximumConnections;
         /// <summary>Maximum reliable packets held by the adapter FIFO per connection.</summary>
@@ -79,6 +81,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public const int MinimumNativePacketPoolSize = 1000;
         /// <summary>Largest native packet pool size this adapter is allowed to configure.</summary>
         public const int MaximumNativePacketPoolSize = 32768;
+        /// <summary>Smallest host-wide receive budget this adapter is allowed to configure.</summary>
+        public const int MinimumMaximumPacketsPerUpdate = 256;
+        /// <summary>Largest host-wide receive budget this adapter is allowed to configure.</summary>
+        public const int MaximumMaximumPacketsPerUpdate = 32768;
 
         /// <summary>Validates and fills optional zero values.</summary>
         public LiteNetLibSettings Normalize(bool listener)
@@ -95,6 +101,27 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 value.ReceiveQueueCapacity = 256;
             if (value.MaximumConnections <= 0)
                 value.MaximumConnections = 128;
+            var maximumPacketsPerUpdate = value.MaximumPacketsPerUpdate;
+            if (maximumPacketsPerUpdate <= 0)
+            {
+                var automatic = listener
+                    ? Math.Max(value.ReceiveQueueCapacity, value.MaximumConnections * 4L)
+                    : value.ReceiveQueueCapacity;
+                if (automatic < MinimumMaximumPacketsPerUpdate)
+                    automatic = MinimumMaximumPacketsPerUpdate;
+                else if (automatic > MaximumMaximumPacketsPerUpdate)
+                    automatic = MaximumMaximumPacketsPerUpdate;
+                maximumPacketsPerUpdate = (int)automatic;
+            }
+            else if (maximumPacketsPerUpdate < MinimumMaximumPacketsPerUpdate)
+            {
+                maximumPacketsPerUpdate = MinimumMaximumPacketsPerUpdate;
+            }
+            else if (maximumPacketsPerUpdate > MaximumMaximumPacketsPerUpdate)
+            {
+                maximumPacketsPerUpdate = MaximumMaximumPacketsPerUpdate;
+            }
+            value.MaximumPacketsPerUpdate = maximumPacketsPerUpdate;
             var nativePoolSize = value.NativePacketPoolSize;
             if (nativePoolSize <= 0)
             {
@@ -314,7 +341,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 MtuOverride = LiteNetLibLimits.Mtu,
                 MtuDiscovery = false,
                 MaxFragmentsCount = LiteNetLibLimits.MaximumFragmentsCount,
-                MaxPacketPerManualReceive = Math.Max(1, settings.ReceiveQueueCapacity),
+                MaxPacketPerManualReceive = settings.MaximumPacketsPerUpdate,
                 PacketPoolSize = settings.NativePacketPoolSize,
                 UnsyncedEvents = false,
                 UnsyncedReceiveEvent = false,

@@ -53,6 +53,65 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
+        public void MaximumPacketsPerUpdateNormalizationAppliesAutoAndBounds()
+        {
+            var client = LiteNetLibSettings.Default;
+            Assert.That(client.Normalize(false).MaximumPacketsPerUpdate,
+                Is.EqualTo(LiteNetLibSettings.MinimumMaximumPacketsPerUpdate));
+
+            var listener = LiteNetLibSettings.Default;
+            Assert.That(listener.Normalize(true).MaximumPacketsPerUpdate,
+                Is.EqualTo(128 * 4));
+
+            var hugeConnections = LiteNetLibSettings.Default;
+            hugeConnections.ReceiveQueueCapacity = 256;
+            hugeConnections.MaximumConnections = 4096;
+            Assert.That(hugeConnections.Normalize(true).MaximumPacketsPerUpdate,
+                Is.EqualTo(4096 * 4));
+
+            var queueScaled = LiteNetLibSettings.Default;
+            queueScaled.ReceiveQueueCapacity = 4096;
+            queueScaled.MaximumConnections = 4;
+            Assert.That(queueScaled.Normalize(true).MaximumPacketsPerUpdate,
+                Is.EqualTo(4096));
+
+            var tinyClientQueue = LiteNetLibSettings.Default;
+            tinyClientQueue.ReceiveQueueCapacity = 1;
+            Assert.That(tinyClientQueue.Normalize(false).MaximumPacketsPerUpdate,
+                Is.EqualTo(LiteNetLibSettings.MinimumMaximumPacketsPerUpdate));
+
+            var belowMinimum = LiteNetLibSettings.Default;
+            belowMinimum.MaximumPacketsPerUpdate =
+                LiteNetLibSettings.MinimumMaximumPacketsPerUpdate - 1;
+            Assert.That(belowMinimum.Normalize(false).MaximumPacketsPerUpdate,
+                Is.EqualTo(LiteNetLibSettings.MinimumMaximumPacketsPerUpdate));
+
+            var aboveMaximum = LiteNetLibSettings.Default;
+            aboveMaximum.MaximumPacketsPerUpdate =
+                LiteNetLibSettings.MaximumMaximumPacketsPerUpdate + 1;
+            Assert.That(aboveMaximum.Normalize(false).MaximumPacketsPerUpdate,
+                Is.EqualTo(LiteNetLibSettings.MaximumMaximumPacketsPerUpdate));
+
+            var withinRange = LiteNetLibSettings.Default;
+            withinRange.MaximumPacketsPerUpdate = 500;
+            Assert.That(withinRange.Normalize(true).MaximumPacketsPerUpdate, Is.EqualTo(500));
+
+            var overflowSafe = LiteNetLibSettings.Default;
+            overflowSafe.ReceiveQueueCapacity = int.MaxValue;
+            overflowSafe.MaximumConnections = int.MaxValue;
+            Assert.That(overflowSafe.Normalize(true).MaximumPacketsPerUpdate,
+                Is.EqualTo(LiteNetLibSettings.MaximumMaximumPacketsPerUpdate));
+            Assert.That(overflowSafe.Normalize(false).MaximumPacketsPerUpdate,
+                Is.EqualTo(LiteNetLibSettings.MaximumMaximumPacketsPerUpdate));
+
+            var perPeerUnchanged = LiteNetLibSettings.Default;
+            perPeerUnchanged.ReceiveQueueCapacity = 8;
+            Assert.That(perPeerUnchanged.Normalize(true).ReceiveQueueCapacity, Is.EqualTo(8));
+            Assert.That(perPeerUnchanged.Normalize(true).MaximumPacketsPerUpdate,
+                Is.EqualTo(128 * 4));
+        }
+
+        [Test]
         public void SimultaneousHostsReportIndependentNativePacketPoolCapacities()
         {
             var firstSettings = LiteNetLibSettings.Default;
@@ -454,6 +513,87 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(complete.NativeReliableBytes, Is.Zero);
                     Assert.That(complete.OutstandingLeases, Is.Zero);
                     Assert.That(complete.DeliveryCallbacks - callbacksBefore, Is.EqualTo(1));
+                }
+            }
+        }
+
+        [Test]
+        public void HostUpdateConsumesGlobalReceiveBudgetBeyondPerPeerCapacity()
+        {
+            const int PeerCount = 2;
+            const int PerPeerPackets = 400;
+            const int PerPeerCapacity = 256;
+            const int GlobalBudget = 512;
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = PerPeerCapacity;
+            settings.MaximumPacketsPerUpdate = GlobalBudget;
+            settings.MaximumConnections = PeerCount;
+
+            byte[] burst;
+            using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+            {
+                var packet = CreatePacket(pool, PacketKind.Ping,
+                    PacketFlags.UnreliableSequenced, 1100);
+                burst = packet.Span.ToArray();
+                packet.Dispose();
+            }
+
+            using (var server = new LiteNetLibServerHost(settings))
+            {
+                var peers = new NativePeerHarness[PeerCount];
+                try
+                {
+                    for (var i = 0; i < PeerCount; i++)
+                    {
+                        peers[i] = new NativePeerHarness(port,
+                            LiteNetLibLimits.MaximumFragmentsCount);
+                        WaitForNativeAccept(server, peers[i]);
+                    }
+
+                    foreach (var peer in peers)
+                    {
+                        for (var i = 0; i < PerPeerPackets; i++)
+                            peer.Send(burst, Native.DeliveryMethod.Sequenced);
+                        peer.Pump();
+                    }
+                    Thread.Sleep(5);
+
+                    var maximumReceivedPerUpdate = 0;
+                    for (var i = 0; i < 1000; i++)
+                    {
+                        foreach (var peer in peers)
+                            peer.Pump();
+                        var before = server.CaptureDiagnostics().NativeReceivedPackets;
+                        server.Update();
+                        server.Flush();
+                        var delta = (int)(server.CaptureDiagnostics().NativeReceivedPackets - before);
+                        if (delta > maximumReceivedPerUpdate)
+                            maximumReceivedPerUpdate = delta;
+                        if (maximumReceivedPerUpdate > PerPeerCapacity &&
+                            server.CaptureDiagnostics().UnreliableReceiveDrops > 0)
+                            break;
+                        Thread.Sleep(1);
+                    }
+
+                    var diagnostics = server.CaptureDiagnostics();
+                    TestContext.Progress.WriteLine(
+                        $"Single-update native receive maximum was {maximumReceivedPerUpdate} " +
+                        $"datagrams with a global budget of {GlobalBudget}.");
+                    Assert.That(maximumReceivedPerUpdate, Is.GreaterThan(PerPeerCapacity));
+                    Assert.That(maximumReceivedPerUpdate, Is.LessThanOrEqualTo(GlobalBudget));
+                    Assert.That(diagnostics.UnreliableReceiveDrops, Is.GreaterThanOrEqualTo(1));
+                    Assert.That(diagnostics.ReliableReceiveOverflowDisconnects, Is.Zero);
+                    Assert.That(diagnostics.Connections, Is.EqualTo(PeerCount));
+                    Assert.That(diagnostics.QueuedPackets,
+                        Is.LessThanOrEqualTo(PeerCount * PerPeerCapacity));
+                }
+                finally
+                {
+                    foreach (var peer in peers)
+                        peer?.Dispose();
                 }
             }
         }
