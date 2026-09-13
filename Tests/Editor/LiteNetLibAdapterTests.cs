@@ -1479,7 +1479,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                                 Assert.That(endpointC.NativeReliableFragments, Is.Zero);
 
                                 while (endpointA.TryGetActiveTicket(out var ticket))
-                                    driver.OnDelivery(null, ticket);
+                                    ticket.Retire();
 
                                 server.Flush();
 
@@ -1491,6 +1491,27 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                                     Is.EqualTo(budget / 3));
                                 Assert.That(endpointC.NativeReliableFragments,
                                     Is.EqualTo(budget / 3));
+
+                                var baselineB = endpointB.NativeReliableFragments;
+                                var baselineC = endpointC.NativeReliableFragments;
+                                for (var cycle = 0; cycle < 3; cycle++)
+                                {
+                                    Assert.That(endpointA.TryGetActiveTicket(out var ticket),
+                                        Is.True,
+                                        "Endpoint A must keep an active ticket available for retirement.");
+                                    Assert.That(ticket.Retire(), Is.True);
+                                    server.Flush();
+                                    Assert.That(server.CaptureDiagnostics().NativeReliableFragments,
+                                        Is.EqualTo(budget),
+                                        "A single freed slot must be refilled exactly once.");
+                                }
+
+                                Assert.That(endpointB.NativeReliableFragments,
+                                    Is.GreaterThan(baselineB),
+                                    "Service must reach B when free quota is smaller than the waiting endpoint count.");
+                                Assert.That(endpointC.NativeReliableFragments,
+                                    Is.GreaterThan(baselineC),
+                                    "Service must reach C when free quota is smaller than the waiting endpoint count.");
                                 AssertEndpointAdmissionNonNegative(endpointA);
                                 AssertEndpointAdmissionNonNegative(endpointB);
                                 AssertEndpointAdmissionNonNegative(endpointC);

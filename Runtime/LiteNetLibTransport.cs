@@ -611,26 +611,39 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private void DrainReliableEndpoints()
         {
             var count = _drainOrder.Count;
+            if (count == 0)
+            {
+                _drainCursor = 0;
+                return;
+            }
+            if (_drainCursor < 0 || _drainCursor >= count)
+                _drainCursor = 0;
+
+            var scan = _drainCursor;
             while (count > 0)
             {
                 var progress = false;
                 for (var visit = 0; visit < count; visit++)
                 {
-                    if (_drainOrder.Count == 0)
-                        break;
-                    if (_drainCursor >= _drainOrder.Count)
+                    var total = _drainOrder.Count;
+                    if (total == 0)
+                    {
                         _drainCursor = 0;
-                    var endpoint = _drainOrder[_drainCursor];
-                    _drainCursor++;
-                    if (endpoint.DrainOneReliable())
-                        progress = true;
+                        return;
+                    }
+                    if (scan >= total)
+                        scan = 0;
+                    var endpoint = _drainOrder[scan];
+                    scan++;
+                    if (!endpoint.DrainOneReliable())
+                        continue;
+                    progress = true;
+                    _drainCursor = scan >= _drainOrder.Count ? 0 : scan;
                 }
                 if (!progress)
                     break;
                 count = _drainOrder.Count;
             }
-            if (_drainOrder.Count == 0)
-                _drainCursor = 0;
         }
 
         private void RemoveFromDrainOrder(LiteNetLibEndpoint endpoint)
