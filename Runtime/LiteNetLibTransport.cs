@@ -1018,7 +1018,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 _pendingSnapshotTick = 0;
         }
 
-        private sealed class PendingReliable
+        private readonly struct PendingReliable
         {
             public PendingReliable(NetworkBufferLease packet, PacketHeader header, int fragments)
             {

@@ -167,14 +167,95 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
                         PacketFlags.ReliableOrdered, 32)), Is.True);
 
+                    var staged = client.CaptureDiagnostics();
+                    Assert.That(staged.PendingReliablePackets, Is.EqualTo(1));
+                    Assert.That(staged.PendingReliableBytes,
+                        Is.EqualTo(PacketHeader.Size + 32));
+
                     var first = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(first, PacketKind.Ping, PacketFlags.ReliableOrdered, 32);
                     first.Dispose();
                     var second = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(second, PacketKind.Pong, PacketFlags.ReliableOrdered, 32);
                     second.Dispose();
 
                     WaitForDelivery(server, client);
+                    var complete = client.CaptureDiagnostics();
+                    Assert.That(complete.PendingReliablePackets, Is.Zero);
+                    Assert.That(complete.PendingReliableBytes, Is.Zero);
+                    Assert.That(complete.NativeReliableFragments, Is.Zero);
+                    Assert.That(complete.NativeReliableBytes, Is.Zero);
                     Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
                     Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
+                }
+            }
+        }
+
+        [Test]
+        public void ReliableFifoEnqueueDoesNotAllocatePerPacket()
+        {
+            const int WarmCount = 1100;
+            const int MeasuredCount = 512;
+            const int PayloadBytes = 32;
+            var packetBytes = PacketHeader.Size + PayloadBytes;
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.ReliableSendQueueCapacity = WarmCount + MeasuredCount + 64;
+            settings.ReliableSendBytesCapacity =
+                (WarmCount + MeasuredCount + 64L) * packetBytes;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Hello,
+                        PacketFlags.ReliableOrdered, PayloadBytes)), Is.True);
+                    Assert.That(client.CaptureDiagnostics().NativeReliableFragments,
+                        Is.EqualTo(1));
+
+                    for (var i = 0; i < WarmCount; i++)
+                    {
+                        Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
+                            PacketFlags.ReliableOrdered, PayloadBytes)), Is.True);
+                    }
+
+                    var measured = new NetworkBufferLease[MeasuredCount];
+                    for (var i = 0; i < MeasuredCount; i++)
+                    {
+                        measured[i] = CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, PayloadBytes);
+                    }
+
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+
+                    var accepted = 0;
+                    var before = GC.GetAllocatedBytesForCurrentThread();
+                    for (var i = 0; i < MeasuredCount; i++)
+                    {
+                        if (client.Endpoint.TrySend(measured[i]))
+                            accepted++;
+                    }
+                    var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+                    Assert.That(accepted, Is.EqualTo(MeasuredCount));
+                    Assert.That(allocated, Is.LessThanOrEqualTo(4096),
+                        $"FIFO enqueue allocated {allocated} bytes for {MeasuredCount} packets.");
+
+                    var diagnostics = client.CaptureDiagnostics();
+                    Assert.That(diagnostics.PendingReliablePackets,
+                        Is.EqualTo(WarmCount + MeasuredCount));
+                    Assert.That(diagnostics.PendingReliableBytes,
+                        Is.EqualTo((WarmCount + MeasuredCount) * (long)packetBytes));
+
+                    client.Endpoint.Dispose();
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
                 }
             }
         }
