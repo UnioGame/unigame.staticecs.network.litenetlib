@@ -1613,11 +1613,12 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                         Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
                         AssertAdmissionCountersNonNegative(server.CaptureDiagnostics());
 
+                        var callbacks = server.CaptureDiagnostics().DeliveryCallbacks;
                         Assert.That(endpointB.TrySend(CreatePacket(pool, PacketKind.Ping,
                             PacketFlags.ReliableOrdered, 32)), Is.True);
-                        var received = WaitForReceive(server, clientB, endpointB);
+                        var received = WaitForReceive(server, clientB, clientB.Endpoint);
                         received.Dispose();
-                        WaitForDeliveryAtLeast(server, clientB, 1);
+                        WaitForServerDelivery(server, clientB, callbacks + 1);
                         AssertAdmissionCountersNonNegative(server.CaptureDiagnostics());
                     }
                 }
