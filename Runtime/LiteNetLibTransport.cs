@@ -317,7 +317,6 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal int DeliveryTicketsRetained => _deliveryTickets.Count;
 
         internal bool ThrowOnNextReliableSubmit { get; set; }
-        internal DeliveryTicket LastRetiredDeliveryTicket { get; private set; }
 
         internal bool ContainsRetainedDeliveryTicket(DeliveryTicket ticket) =>
             _deliveryTickets.Contains(ticket);
@@ -582,11 +581,6 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 return;
             }
             _deliveryTickets.Enqueue(ticket);
-        }
-
-        internal void MarkTicketRetired(DeliveryTicket ticket)
-        {
-            LastRetiredDeliveryTicket = ticket;
         }
 
         private static int FragmentCount(int bytes) =>
@@ -880,7 +874,6 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _accepted.Clear();
             _disconnected.Clear();
             _deliveryTickets.Clear();
-            LastRetiredDeliveryTicket = null;
             _manager.Stop(false);
             _pool.Dispose();
         }
@@ -957,6 +950,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                         (int)DeliveryTicketState.Active) != (int)DeliveryTicketState.Active)
                     return false;
                 _endpoint.CompleteTicket(this);
+                ClearOwnership();
                 _driver.ReturnDeliveryTicket(this);
                 return true;
             }
@@ -967,9 +961,17 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                         (int)DeliveryTicketState.Retired,
                         (int)DeliveryTicketState.Active) != (int)DeliveryTicketState.Active)
                     return false;
-                _driver.MarkTicketRetired(this);
                 _endpoint.CompleteTicket(this);
+                ClearOwnership();
                 return true;
+            }
+
+            private void ClearOwnership()
+            {
+                _endpoint = null;
+                Fragments = 0;
+                Bytes = 0;
+                Snapshot = false;
             }
         }
     }

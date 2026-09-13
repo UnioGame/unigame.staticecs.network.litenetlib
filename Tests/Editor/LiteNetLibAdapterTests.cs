@@ -1,6 +1,7 @@
 using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using Native = global::LiteNetLib;
 using NUnit.Framework;
@@ -880,6 +881,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(driver.DeliveryTicketsReused, Is.Zero);
                     Assert.That(clientEndpoint.NativeReliableFragments, Is.Zero);
                     Assert.That(clientEndpoint.NativeReliableBytes, Is.Zero);
+                    Assert.That(ticket.Endpoint, Is.Null,
+                        "A completed ticket must release its endpoint.");
+                    Assert.That(ticket.Fragments, Is.Zero);
+                    Assert.That(ticket.Bytes, Is.Zero);
+                    Assert.That(ticket.Snapshot, Is.False);
 
                     Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
                         PacketFlags.ReliableOrdered, 32)), Is.True);
@@ -892,7 +898,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
-        public void LateDeliveryCallbackAfterInjectedSendFailureIsHarmless()
+        public void InjectedReliableSubmitFailureRetiresTicketWithoutRetention()
         {
             var port = FindFreePort();
             var settings = LiteNetLibSettings.Default;
@@ -903,6 +909,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             using (var client = new LiteNetLibClientHost(settings))
             {
                 WaitForAccept(server, client);
+                var clientEndpoint = (LiteNetLibEndpoint)client.Endpoint;
                 var driver = client.Driver;
                 using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
                 {
@@ -910,21 +917,27 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
                         PacketFlags.ReliableOrdered, 32)), Is.False);
 
-                    var retired = driver.LastRetiredDeliveryTicket;
-                    Assert.That(retired, Is.Not.Null);
-                    Assert.That(retired.State,
-                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
-                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
-                    Assert.That(driver.ContainsRetainedDeliveryTicket(retired), Is.False);
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1));
+                    Assert.That(driver.DeliveryTicketsRented, Is.EqualTo(1));
+                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero,
+                        "A failed submit must retire its ticket without pooling it.");
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out _), Is.False);
+                    Assert.That(clientEndpoint.NativeReliableFragments, Is.Zero);
+                    Assert.That(clientEndpoint.NativeReliableBytes, Is.Zero);
 
-                    driver.OnDelivery(null, retired);
-                    driver.OnDelivery(null, retired);
+                    var diagnostics = client.CaptureDiagnostics();
+                    Assert.That(diagnostics.SendFailures, Is.EqualTo(1));
+                    Assert.That(diagnostics.NativeReliableBytes, Is.Zero);
+                    Assert.That(diagnostics.OutstandingLeases, Is.Zero);
 
-                    Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
-                    Assert.That(driver.ContainsRetainedDeliveryTicket(retired), Is.False);
-                    Assert.That(retired.Retire(), Is.False);
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(2),
+                        "A retired failed ticket must not be pooled or reused.");
                     Assert.That(driver.DeliveryTicketsReused, Is.Zero);
-                    Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                    Assert.That(clientEndpoint.TryGetActiveTicket(out var active), Is.True);
+                    Assert.That(active.State,
+                        Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Active));
                 }
             }
         }
@@ -955,6 +968,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(ticket.State,
                         Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
                     driver.OnDelivery(null, ticket);
+                    Assert.That(ticket.Endpoint, Is.Null,
+                        "A retired ticket must release its endpoint.");
+                    Assert.That(ticket.Fragments, Is.Zero);
+                    Assert.That(ticket.Bytes, Is.Zero);
+                    Assert.That(ticket.Snapshot, Is.False);
                     Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
                     Assert.That(driver.ContainsRetainedDeliveryTicket(ticket), Is.False);
                 }
@@ -977,6 +995,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(ticket.State,
                         Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
                     driver.OnDelivery(null, ticket);
+                    Assert.That(ticket.Endpoint, Is.Null,
+                        "A retired ticket must release its endpoint.");
+                    Assert.That(ticket.Fragments, Is.Zero);
+                    Assert.That(ticket.Bytes, Is.Zero);
+                    Assert.That(ticket.Snapshot, Is.False);
                     Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
                     Assert.That(driver.ContainsRetainedDeliveryTicket(ticket), Is.False);
                 }
@@ -999,6 +1022,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(ticket.State,
                         Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
                     driver.OnDelivery(null, ticket);
+                    Assert.That(ticket.Endpoint, Is.Null,
+                        "A retired ticket must release its endpoint.");
+                    Assert.That(ticket.Fragments, Is.Zero);
+                    Assert.That(ticket.Bytes, Is.Zero);
+                    Assert.That(ticket.Snapshot, Is.False);
                     Assert.That(driver.DeliveryTicketsRetained, Is.Zero);
                     Assert.That(driver.ContainsRetainedDeliveryTicket(ticket), Is.False);
                 }
@@ -1050,6 +1078,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(clientEndpoint.NativeReliableBytes, Is.Zero);
                     Assert.That(driver.DeliveryTicketsCreated, Is.EqualTo(1));
                     Assert.That(driver.DeliveryTicketsRetained, Is.EqualTo(1));
+                    Assert.That(ticket.Endpoint, Is.Null,
+                        "A completed ticket must release its endpoint.");
+                    Assert.That(ticket.Fragments, Is.Zero);
+                    Assert.That(ticket.Bytes, Is.Zero);
+                    Assert.That(ticket.Snapshot, Is.False);
                     Assert.That(ticket.CompleteByCallback(), Is.False,
                         "A completed ticket must not complete twice.");
                 }
@@ -1139,6 +1172,104 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(driver.DeliveryTicketsDiscarded, Is.Zero);
                 }
                 client.Dispose();
+            }
+        }
+
+        [Test]
+        public void RetainedDeliveryTicketDoesNotKeepDisconnectedEndpointAlive()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 16;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            {
+                var driver = server.Driver;
+                var endpointRef = CreateDisconnectedServerEndpoint(server, settings,
+                    out var retained);
+
+                Assert.That(retained.Endpoint, Is.Null,
+                    "The pooled ticket must not retain its disconnected endpoint.");
+                Assert.That(retained.Fragments, Is.Zero);
+                Assert.That(retained.Bytes, Is.Zero);
+                Assert.That(retained.Snapshot, Is.False);
+                Assert.That(driver.DeliveryTicketsRetained, Is.GreaterThan(0),
+                    "At least one cleared ticket must remain in the pool.");
+                Assert.That(driver.ContainsRetainedDeliveryTicket(retained), Is.True);
+
+                // Unity's conservative Boehm collector cannot prove unreachability deterministically,
+                // so the direct ownership-release assertions above are the Unity guarantee. The
+                // collector proof is deterministic on the net8 runtime and runs there.
+#if UNITY_5_3_OR_NEWER
+                Assert.That(endpointRef, Is.Not.Null);
+#else
+                ForceGarbageCollection(endpointRef, 8);
+
+                Assert.That(endpointRef.IsAlive, Is.False,
+                    "A disconnected endpoint must be collectible while its ticket stays pooled.");
+                Assert.That(driver.DeliveryTicketsRetained, Is.GreaterThan(0),
+                    "Collection must not discard the pooled ticket.");
+                Assert.That(driver.ContainsRetainedDeliveryTicket(retained), Is.True);
+#endif
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static WeakReference CreateDisconnectedServerEndpoint(
+            LiteNetLibServerHost server, LiteNetLibSettings settings,
+            out LiteNetLibDriver.DeliveryTicket ticket)
+        {
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var callbacks = server.CaptureDiagnostics().DeliveryCallbacks;
+                    Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                        PacketFlags.ReliableOrdered, 64, 20)), Is.True);
+                    Assert.That(endpoint.TryGetActiveTicket(out ticket), Is.True);
+
+                    WaitForServerDelivery(server, client, callbacks + 1);
+
+                    Assert.That(ticket.Endpoint, Is.Null,
+                        "A completed ticket must release its endpoint.");
+                    Assert.That(ticket.Fragments, Is.Zero);
+                    Assert.That(ticket.Bytes, Is.Zero);
+                    Assert.That(ticket.Snapshot, Is.False);
+                    Assert.That(server.Driver.ContainsRetainedDeliveryTicket(ticket), Is.True);
+                }
+
+                var reference = new WeakReference(endpoint);
+                endpoint.Dispose();
+                WaitForServerConnections(server, client, 0);
+                endpoint = null;
+                client.Dispose();
+                return reference;
+            }
+        }
+
+        private static void WaitForServerConnections(LiteNetLibServerHost server,
+            LiteNetLibClientHost client, int expected)
+        {
+            for (var i = 0; i < 800; i++)
+            {
+                if (server.CaptureDiagnostics().Connections == expected)
+                    return;
+                Pump(server, client);
+                Thread.Sleep(1);
+            }
+            Assert.Fail("Server connections did not reach " + expected + ".");
+        }
+
+        private static void ForceGarbageCollection(WeakReference reference, int attempts)
+        {
+            for (var i = 0; i < attempts && reference.IsAlive; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
             }
         }
 
