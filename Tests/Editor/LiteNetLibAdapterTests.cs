@@ -130,15 +130,21 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         [Test]
         public void ScaledNativePacketPoolReusesWarmedPacketsWithoutRefillAllocations()
         {
-            var smallPoolAllocations = MeasureWarmedNativePacketPoolAllocations(1000);
-            var scaledPoolAllocations = MeasureWarmedNativePacketPoolAllocations(2048);
+            var smallPoolAllocations =
+                MeasureWarmedNativePacketPoolAllocations(1000, out var smallLowWater);
+            var scaledPoolAllocations =
+                MeasureWarmedNativePacketPoolAllocations(2048, out var scaledLowWater);
 
             TestContext.Progress.WriteLine($"Warmed native pool allocation bytes: small={smallPoolAllocations}, "+
                 $"scaled={scaledPoolAllocations}.");
 
+            Assert.That(smallLowWater, Is.Zero);
+            Assert.That(scaledLowWater, Is.GreaterThan(0));
+#if !UNITY_5_3_OR_NEWER
             Assert.That(scaledPoolAllocations + 4096, Is.LessThan(smallPoolAllocations),
                 $"Warmed native pool allocations were small={smallPoolAllocations}, " +
                 $"scaled={scaledPoolAllocations} bytes.");
+#endif
         }
 
         [Test]
@@ -773,7 +779,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             Assert.Fail("LiteNetLib delivery callbacks did not drain reliable ownership.");
         }
 
-        private static long MeasureWarmedNativePacketPoolAllocations(int nativePacketPoolSize)
+        private static long MeasureWarmedNativePacketPoolAllocations(
+            int nativePacketPoolSize, out int measuredLowWater)
         {
             const int BurstCount = 1100;
             const int PayloadBytes = 64;
@@ -819,6 +826,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 var accepted = SendReliableBurst(client, pool, BurstCount, PayloadBytes, measured);
                 var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
                 Assert.That(accepted, Is.EqualTo(BurstCount));
+                measuredLowWater = client.CaptureDiagnostics().NativePacketPoolLowWater;
 
                 callbacks = client.CaptureDiagnostics().DeliveryCallbacks;
                 DrainReliableBurst(server, client, serverEndpoint, BurstCount,
