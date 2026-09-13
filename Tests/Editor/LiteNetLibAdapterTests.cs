@@ -120,8 +120,25 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
 
                     Assert.That(observed, Is.GreaterThanOrEqualTo(0));
                     Assert.That(observed, Is.LessThanOrEqualTo(capacity));
+                    var final = client.CaptureDiagnostics();
+                    Assert.That(final.NativePacketPoolCount, Is.InRange(0, capacity));
+                    Assert.That(final.NativePacketPoolLowWater, Is.InRange(0, capacity));
                 }
             }
+        }
+
+        [Test]
+        public void ScaledNativePacketPoolReusesWarmedPacketsWithoutRefillAllocations()
+        {
+            var smallPoolAllocations = MeasureWarmedNativePacketPoolAllocations(1000);
+            var scaledPoolAllocations = MeasureWarmedNativePacketPoolAllocations(2048);
+
+            TestContext.Progress.WriteLine($"Warmed native pool allocation bytes: small={smallPoolAllocations}, "+
+                $"scaled={scaledPoolAllocations}.");
+
+            Assert.That(scaledPoolAllocations + 4096, Is.LessThan(smallPoolAllocations),
+                $"Warmed native pool allocations were small={smallPoolAllocations}, " +
+                $"scaled={scaledPoolAllocations} bytes.");
         }
 
         [Test]
@@ -754,6 +771,99 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 Thread.Sleep(1);
             }
             Assert.Fail("LiteNetLib delivery callbacks did not drain reliable ownership.");
+        }
+
+        private static long MeasureWarmedNativePacketPoolAllocations(int nativePacketPoolSize)
+        {
+            const int BurstCount = 1100;
+            const int PayloadBytes = 64;
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = BurstCount + 64;
+            settings.NativePacketPoolSize = nativePacketPoolSize;
+            settings.NativeReliableFragmentsCapacity = BurstCount + 64;
+            settings.NativeReliableBytesCapacity =
+                (PacketHeader.Size + PayloadBytes) * (long)(BurstCount + 64);
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                var callbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+
+                SendReliableBurst(client, pool, BurstCount, PayloadBytes, null);
+                DrainReliableBurst(server, client, serverEndpoint, BurstCount,
+                    callbacks + BurstCount);
+
+                var warmed = client.CaptureDiagnostics();
+                Assert.That(warmed.NativePacketPoolCapacity, Is.EqualTo(nativePacketPoolSize));
+                Assert.That(warmed.NativePacketPoolCount,
+                    Is.InRange(Math.Min(BurstCount, nativePacketPoolSize),
+                        nativePacketPoolSize));
+
+                var measured = new NetworkBufferLease[BurstCount];
+                for (var i = 0; i < measured.Length; i++)
+                {
+                    measured[i] = CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, PayloadBytes);
+                }
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+
+                var before = GC.GetAllocatedBytesForCurrentThread();
+                var accepted = SendReliableBurst(client, pool, BurstCount, PayloadBytes, measured);
+                var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                Assert.That(accepted, Is.EqualTo(BurstCount));
+
+                callbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                DrainReliableBurst(server, client, serverEndpoint, BurstCount,
+                    callbacks + BurstCount);
+                Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                return allocated;
+            }
+        }
+
+        private static int SendReliableBurst(LiteNetLibClientHost client,
+            NetworkBufferPool pool, int count, int payloadBytes, NetworkBufferLease[] packets)
+        {
+            var accepted = 0;
+            for (var i = 0; i < count; i++)
+            {
+                var packet = packets == null
+                    ? CreatePacket(pool, PacketKind.Ping, PacketFlags.ReliableOrdered, payloadBytes)
+                    : packets[i];
+                if (client.Endpoint.TrySend(packet))
+                    accepted++;
+            }
+            Assert.That(accepted, Is.EqualTo(count));
+            return accepted;
+        }
+
+        private static void DrainReliableBurst(LiteNetLibServerHost server,
+            LiteNetLibClientHost client, INetworkTransport endpoint, int packets, long callbacks)
+        {
+            var received = 0;
+            for (var i = 0; i < 5000; i++)
+            {
+                while (endpoint.TryReceive(out var packet))
+                {
+                    packet.Dispose();
+                    received++;
+                }
+                var diagnostics = client.CaptureDiagnostics();
+                if (received == packets && diagnostics.NativeReliableBytes == 0 &&
+                    diagnostics.DeliveryCallbacks >= callbacks)
+                    return;
+                Pump(server, client);
+                Thread.Sleep(1);
+            }
+            Assert.Fail($"Reliable burst did not drain: received={received}/{packets}, " +
+                $"callbacks={client.CaptureDiagnostics().DeliveryCallbacks}/{callbacks}.");
         }
 
         private sealed class NativePeerHarness : IDisposable

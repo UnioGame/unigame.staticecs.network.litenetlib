@@ -801,7 +801,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 ReliableReceiveOverflowDisconnects = _reliableReceiveOverflowDisconnects,
                 UnreliableReceiveDrops = _unreliableReceiveDrops,
                 NativePacketPoolCount = _manager.PoolCount,
-                NativePacketPoolCapacity = _settings.NativePacketPoolSize,
+                NativePacketPoolCapacity = _manager.PacketPoolSize,
                 NativePacketPoolLowWater = _nativePacketPoolLowWater,
             };
         }
