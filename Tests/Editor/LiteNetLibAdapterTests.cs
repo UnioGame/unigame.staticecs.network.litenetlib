@@ -26,6 +26,105 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
+        public void NativePacketPoolSizeNormalizationAppliesRoleDefaultsAndBounds()
+        {
+            var client = LiteNetLibSettings.Default.Normalize(false);
+            Assert.That(client.NativePacketPoolSize, Is.EqualTo(1000));
+
+            var listener = LiteNetLibSettings.Default.Normalize(true);
+            Assert.That(listener.NativePacketPoolSize, Is.EqualTo(8192));
+
+            var belowMinimum = LiteNetLibSettings.Default;
+            belowMinimum.NativePacketPoolSize =
+                LiteNetLibSettings.MinimumNativePacketPoolSize - 1;
+            Assert.That(belowMinimum.Normalize(false).NativePacketPoolSize,
+                Is.EqualTo(LiteNetLibSettings.MinimumNativePacketPoolSize));
+
+            var aboveMaximum = LiteNetLibSettings.Default;
+            aboveMaximum.NativePacketPoolSize =
+                LiteNetLibSettings.MaximumNativePacketPoolSize + 1;
+            Assert.That(aboveMaximum.Normalize(false).NativePacketPoolSize,
+                Is.EqualTo(LiteNetLibSettings.MaximumNativePacketPoolSize));
+
+            var hugeListener = LiteNetLibSettings.Default;
+            hugeListener.MaximumConnections = int.MaxValue;
+            Assert.That(hugeListener.Normalize(true).NativePacketPoolSize,
+                Is.EqualTo(LiteNetLibSettings.MaximumNativePacketPoolSize));
+        }
+
+        [Test]
+        public void SimultaneousHostsReportIndependentNativePacketPoolCapacities()
+        {
+            var firstSettings = LiteNetLibSettings.Default;
+            firstSettings.Address = "127.0.0.1";
+            firstSettings.Port = FindFreePort();
+            firstSettings.NativePacketPoolSize = 1000;
+
+            var secondSettings = LiteNetLibSettings.Default;
+            secondSettings.Address = "127.0.0.1";
+            secondSettings.Port = FindFreePort();
+            secondSettings.NativePacketPoolSize = 2048;
+
+            using (var first = new LiteNetLibServerHost(firstSettings))
+            using (var second = new LiteNetLibServerHost(secondSettings))
+            {
+                Assert.That(first.CaptureDiagnostics().NativePacketPoolCapacity,
+                    Is.EqualTo(1000));
+                Assert.That(second.CaptureDiagnostics().NativePacketPoolCapacity,
+                    Is.EqualTo(2048));
+            }
+        }
+
+        [Test]
+        public void NativePacketPoolDiagnosticsObserveLowWaterAfterTraffic()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = 8;
+            settings.NativePacketPoolSize = 1000;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var initial = client.CaptureDiagnostics();
+                Assert.That(initial.NativePacketPoolLowWater, Is.EqualTo(-1));
+                Assert.That(initial.NativePacketPoolCapacity, Is.EqualTo(1000));
+
+                var serverEndpoint = WaitForAccept(server, client);
+                var callbacksBefore = client.CaptureDiagnostics().DeliveryCallbacks;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    var received = WaitForReceive(server, client, serverEndpoint);
+                    received.Dispose();
+                    WaitForDeliveryAtLeast(server, client, callbacksBefore + 1);
+
+                    var observed = -1;
+                    var capacity = initial.NativePacketPoolCapacity;
+                    for (var i = 0; i < 400; i++)
+                    {
+                        client.Update();
+                        client.Flush();
+                        var diagnostics = client.CaptureDiagnostics();
+                        if (diagnostics.NativePacketPoolLowWater >= 0)
+                        {
+                            observed = diagnostics.NativePacketPoolLowWater;
+                            capacity = diagnostics.NativePacketPoolCapacity;
+                            break;
+                        }
+                        Thread.Sleep(1);
+                    }
+
+                    Assert.That(observed, Is.GreaterThanOrEqualTo(0));
+                    Assert.That(observed, Is.LessThanOrEqualTo(capacity));
+                }
+            }
+        }
+
+        [Test]
         public void NonlocalClientDestinationUsesEphemeralLocalSocket()
         {
             var settings = LiteNetLibSettings.Default;

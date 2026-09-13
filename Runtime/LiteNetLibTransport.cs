@@ -56,6 +56,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public int NativeReliableFragmentsCapacity;
         /// <summary>Maximum native reliable bytes accounted as queued or in flight per connection.</summary>
         public long NativeReliableBytesCapacity;
+        /// <summary>Native LiteNetLib packet pool size; zero selects a role-based default.</summary>
+        public int NativePacketPoolSize;
 
         /// <summary>Gets conservative defaults for one separated endpoint.</summary>
         public static LiteNetLibSettings Default => new LiteNetLibSettings
@@ -73,6 +75,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         /// <summary>Maximum complete reliable packet bytes supported by this adapter.</summary>
         public const int MaximumReliableBytes = LiteNetLibLimits.MaximumReliableBytes;
+        /// <summary>Smallest native packet pool size this adapter is allowed to configure.</summary>
+        public const int MinimumNativePacketPoolSize = 1000;
+        /// <summary>Largest native packet pool size this adapter is allowed to configure.</summary>
+        public const int MaximumNativePacketPoolSize = 32768;
 
         /// <summary>Validates and fills optional zero values.</summary>
         public LiteNetLibSettings Normalize(bool listener)
@@ -89,6 +95,19 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 value.ReceiveQueueCapacity = 256;
             if (value.MaximumConnections <= 0)
                 value.MaximumConnections = 128;
+            var nativePoolSize = value.NativePacketPoolSize;
+            if (nativePoolSize <= 0)
+            {
+                nativePoolSize = listener
+                    ? (int)Math.Min(int.MaxValue,
+                        value.MaximumConnections * (long)NetConstants.DefaultWindowSize)
+                    : MinimumNativePacketPoolSize;
+            }
+            if (nativePoolSize < MinimumNativePacketPoolSize)
+                nativePoolSize = MinimumNativePacketPoolSize;
+            if (nativePoolSize > MaximumNativePacketPoolSize)
+                nativePoolSize = MaximumNativePacketPoolSize;
+            value.NativePacketPoolSize = nativePoolSize;
             if (value.ReliableSendQueueCapacity <= 0)
                 value.ReliableSendQueueCapacity = 64;
             if (value.ReliableSendBytesCapacity <= 0)
@@ -176,6 +195,12 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public long ReliableReceiveOverflowDisconnects;
         /// <summary>Number of sequenced packets dropped because a receive queue was full.</summary>
         public long UnreliableReceiveDrops;
+        /// <summary>Current number of packets held by the native LiteNetLib packet pool.</summary>
+        public int NativePacketPoolCount;
+        /// <summary>Configured native LiteNetLib packet pool capacity.</summary>
+        public int NativePacketPoolCapacity;
+        /// <summary>Lowest observed native pool count, or -1 until the pool is first seen with packets.</summary>
+        public int NativePacketPoolLowWater;
     }
 
     /// <summary>Owns one manual-pump LiteNetLib client and exact-packet endpoint.</summary>
@@ -270,6 +295,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private long _nativeReliableBytes;
         private int _nativeReliableFragmentsHighWater;
         private long _nativeReliableBytesHighWater;
+        private int _nativePacketPoolLowWater = -1;
+        private bool _nativePacketPoolObserved;
 
         internal LiteNetLibDriver(LiteNetLibSettings settings, bool listener)
         {
@@ -288,6 +315,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 MtuDiscovery = false,
                 MaxFragmentsCount = LiteNetLibLimits.MaximumFragmentsCount,
                 MaxPacketPerManualReceive = Math.Max(1, settings.ReceiveQueueCapacity),
+                PacketPoolSize = settings.NativePacketPoolSize,
                 UnsyncedEvents = false,
                 UnsyncedReceiveEvent = false,
                 UnsyncedDeliveryEvent = false,
@@ -335,6 +363,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             ThrowIfDisposed();
             using var nativeScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.NativeUpdate);
             _manager.PollEvents();
+            ObserveNativePacketPool();
         }
 
         internal void Flush()
@@ -350,6 +379,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 elapsed = 0.001f;
             using var nativeScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.NativeUpdate);
             _manager.ManualUpdate(elapsed);
+            ObserveNativePacketPool();
         }
 
         internal bool TryAccept(out INetworkTransport endpoint)
@@ -478,6 +508,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 endpoint.TrackTicket(ticket);
                 RegisterNative(ticket);
                 endpoint.Peer.SendWithDeliveryEvent(packet.Span, DeliveryMethod.ReliableOrdered, ticket);
+                ObserveNativePacketPool();
                 _sent++;
                 _reliableSentPackets++;
                 _reliableSentBytes += packet.Length;
@@ -699,6 +730,23 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _reliableSendQueueOverflows++;
         }
 
+        private void ObserveNativePacketPool()
+        {
+            var count = _manager.PoolCount;
+            if (count < 0)
+                return;
+            if (!_nativePacketPoolObserved)
+            {
+                if (count <= 0)
+                    return;
+                _nativePacketPoolObserved = true;
+                _nativePacketPoolLowWater = count;
+                return;
+            }
+            if (count < _nativePacketPoolLowWater)
+                _nativePacketPoolLowWater = count;
+        }
+
         internal LiteNetLibDiagnostics CaptureDiagnostics()
         {
             var pendingPackets = 0;
@@ -752,6 +800,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 DeliveryCallbacks = _deliveryCallbacks,
                 ReliableReceiveOverflowDisconnects = _reliableReceiveOverflowDisconnects,
                 UnreliableReceiveDrops = _unreliableReceiveDrops,
+                NativePacketPoolCount = _manager.PoolCount,
+                NativePacketPoolCapacity = _settings.NativePacketPoolSize,
+                NativePacketPoolLowWater = _nativePacketPoolLowWater,
             };
         }
 
