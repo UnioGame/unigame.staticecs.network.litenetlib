@@ -2596,6 +2596,155 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
+        public void ReliablePreflightHonorsGlobalManagedFragmentLimit()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.MaximumConnections = 1;
+            settings.NativePacketPoolSize = 1000;
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.NativeReliableBytesCapacity = LiteNetLibLimits.MaximumReliableBytes * 128L;
+            settings.ReceiveQueueCapacity = 256;
+            settings.ReliableSendQueueCapacity = 128;
+            settings.ReliableSendBytesCapacity = LiteNetLibLimits.MaximumReliableBytes * 128L;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                var driver = server.Driver;
+                var limit = driver.GlobalReliableFragmentsLimit;
+                Assert.That(limit, Is.EqualTo(3000));
+
+                using (var pool = new NetworkBufferPool(
+                           NetworkBufferPool.DefaultServerRetainedBytes))
+                {
+                    var maxPayload = LiteNetLibLimits.MaximumReliableBytes - PacketHeader.Size;
+                    var fullPackets = limit / LiteNetLibLimits.MaximumFragmentsCount;
+                    var remainder = limit - fullPackets * LiteNetLibLimits.MaximumFragmentsCount;
+                    var remainderPayload =
+                        remainder * LiteNetLibLimits.ReliableFragmentPayloadBytes - PacketHeader.Size;
+                    var remainderBytes = PacketHeader.Size + remainderPayload;
+
+                    for (var i = 0; i < fullPackets; i++)
+                    {
+                        Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, maxPayload)), Is.True);
+                    }
+                    Assert.That(driver.PendingReliableFragments,
+                        Is.EqualTo(fullPackets * LiteNetLibLimits.MaximumFragmentsCount));
+
+                    // The final aggregated packet still fits: preflight is true and side-effect-free.
+                    var lastAdmissible = server.CaptureDiagnostics();
+                    var lastAdmissibleLeases = pool.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(remainderBytes), Is.True,
+                        "the last admissible fragment state must preflight as true");
+                    Assert.That(endpoint.CanAcceptReliablePacket(remainderBytes), Is.True);
+                    AssertPreflightDiagnosticsUnchanged(lastAdmissible,
+                        server.CaptureDiagnostics());
+                    AssertPreflightLeasesUnchanged(lastAdmissibleLeases,
+                        pool.CaptureDiagnostics());
+
+                    Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, remainderPayload)), Is.True);
+                    Assert.That(driver.PendingReliableFragments, Is.EqualTo(limit));
+
+                    // The driver-wide managed fragment budget is exhausted: probes stay false.
+                    var exhausted = server.CaptureDiagnostics();
+                    var exhaustedLeases = pool.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(remainderBytes), Is.False,
+                        "an exhausted global managed fragment budget must preflight as false");
+                    Assert.That(endpoint.CanAcceptReliablePacket(PacketHeader.Size + 32), Is.False);
+                    Assert.That(endpoint.CanAcceptReliablePacket(remainderBytes), Is.False);
+                    AssertPreflightDiagnosticsUnchanged(exhausted,
+                        server.CaptureDiagnostics());
+                    AssertPreflightLeasesUnchanged(exhaustedLeases,
+                        pool.CaptureDiagnostics());
+
+                    endpoint.Dispose();
+                    Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                    Assert.That(driver.PendingReliableFragments, Is.Zero);
+                    Assert.That(driver.PendingReliableBytes, Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void ReliablePreflightHonorsGlobalManagedByteLimit()
+        {
+            var packetBytes = LiteNetLibLimits.MaximumReliableBytes;
+            var payloadBytes = packetBytes - PacketHeader.Size;
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.MaximumConnections = 1;
+            settings.NativePacketPoolSize = 16384;
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.NativeReliableBytesCapacity = packetBytes;
+            settings.ReceiveQueueCapacity = 600;
+            settings.ReliableSendQueueCapacity = 600;
+            settings.ReliableSendBytesCapacity = 64L * 1024 * 1024;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                var driver = server.Driver;
+                var limit = driver.GlobalReliableBytesLimit;
+                Assert.That(limit, Is.EqualTo(32L * 1024 * 1024));
+                Assert.That(limit % packetBytes, Is.Zero);
+
+                using (var pool = new NetworkBufferPool(
+                           NetworkBufferPool.DefaultServerRetainedBytes))
+                {
+                    var fullPackets = (int)(limit / packetBytes);
+                    for (var i = 0; i < fullPackets - 1; i++)
+                    {
+                        Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                            PacketFlags.ReliableOrdered, payloadBytes)), Is.True);
+                    }
+                    Assert.That(driver.PendingReliableBytes,
+                        Is.EqualTo((fullPackets - 1) * (long)packetBytes));
+
+                    // One more full packet exactly fits: preflight is true and side-effect-free.
+                    var lastAdmissible = server.CaptureDiagnostics();
+                    var lastAdmissibleLeases = pool.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes), Is.True,
+                        "the last admissible byte state must preflight as true");
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes), Is.True);
+                    AssertPreflightDiagnosticsUnchanged(lastAdmissible,
+                        server.CaptureDiagnostics());
+                    AssertPreflightLeasesUnchanged(lastAdmissibleLeases,
+                        pool.CaptureDiagnostics());
+
+                    Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, payloadBytes)), Is.True);
+                    Assert.That(driver.PendingReliableBytes, Is.EqualTo(limit));
+
+                    // The driver-wide managed byte budget is exhausted: probes stay false.
+                    var exhausted = server.CaptureDiagnostics();
+                    var exhaustedLeases = pool.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes), Is.False,
+                        "an exhausted global managed byte budget must preflight as false");
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes), Is.False);
+                    Assert.That(endpoint.CanAcceptReliablePacket(PacketHeader.Size + 32), Is.False);
+                    AssertPreflightDiagnosticsUnchanged(exhausted,
+                        server.CaptureDiagnostics());
+                    AssertPreflightLeasesUnchanged(exhaustedLeases,
+                        pool.CaptureDiagnostics());
+
+                    endpoint.Dispose();
+                    Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                    Assert.That(driver.PendingReliableBytes, Is.Zero);
+                    Assert.That(driver.PendingReliableFragments, Is.Zero);
+                }
+            }
+        }
+
+        [Test]
         public void ReliablePreflightRejectsDisconnectedAndDisposedEndpoints()
         {
             var packetBytes = PacketHeader.Size + 32;
@@ -2660,6 +2809,13 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 Is.EqualTo(before.SentPackets));
             Assert.That(after.OutstandingLeases,
                 Is.EqualTo(before.OutstandingLeases));
+        }
+
+        private static void AssertPreflightLeasesUnchanged(
+            NetworkBufferPoolDiagnostics before, NetworkBufferPoolDiagnostics after)
+        {
+            Assert.That(after.OutstandingLeases, Is.EqualTo(before.OutstandingLeases));
+            Assert.That(after.OutstandingBytes, Is.EqualTo(before.OutstandingBytes));
         }
 
         private static void SendReliableEndpointBurst(LiteNetLibEndpoint endpoint,
