@@ -166,8 +166,16 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public int PendingReliablePacketsHighWater;
         /// <summary>Highest observed adapter FIFO byte count.</summary>
         public long PendingReliableBytesHighWater;
+        /// <summary>Number of reliable fragments currently held by adapter FIFOs.</summary>
+        public int PendingReliableFragments;
+        /// <summary>Highest observed adapter FIFO fragment count.</summary>
+        public int PendingReliableFragmentsHighWater;
         /// <summary>Number of reliable packets rejected because an adapter FIFO was full.</summary>
         public long ReliableSendQueueOverflows;
+        /// <summary>Number of reliable packets rejected by an endpoint's own FIFO limit.</summary>
+        public long EndpointReliableAdmissionRejections;
+        /// <summary>Number of reliable packets rejected by a driver-wide managed budget.</summary>
+        public long GlobalReliableAdmissionRejections;
         /// <summary>Number of complete packets currently queued for receive.</summary>
         public int QueuedPackets;
         /// <summary>Number of receive leases currently owned outside the transport pool.</summary>
@@ -295,8 +303,14 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private long _deliveryCallbacks;
         private long _reliableReceiveOverflowDisconnects;
         private long _unreliableReceiveDrops;
+        private int _pendingReliablePackets;
+        private long _pendingReliableBytes;
+        private int _pendingReliableFragments;
         private int _pendingReliablePacketsHighWater;
         private long _pendingReliableBytesHighWater;
+        private int _pendingReliableFragmentsHighWater;
+        private long _endpointReliableAdmissionRejections;
+        private long _globalReliableAdmissionRejections;
         private int _nativeReliableFragments;
         private long _nativeReliableBytes;
         private int _nativeReliableFragmentsHighWater;
@@ -321,6 +335,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         internal int NativeFragmentAdmissionBudget => _nativeFragmentAdmissionBudget;
 
+        /// <summary>Lowest driver-wide managed reliable byte budget for a listener.</summary>
+        internal const long MinimumGlobalReliableBytes = 32L * 1024 * 1024;
+        /// <summary>Highest driver-wide managed reliable byte budget for a listener.</summary>
+        internal const long MaximumGlobalReliableBytes = 64L * 1024 * 1024;
+
         /// <summary>Computes the driver-wide native fragment admission budget for a packet pool.</summary>
         internal static int ComputeNativeFragmentAdmissionBudget(int nativePacketPoolSize)
         {
@@ -330,6 +349,80 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             return Math.Min(nativePacketPoolSize,
                 Math.Max(LiteNetLibLimits.MaximumFragmentsCount, scaled));
         }
+
+        internal int PendingReliablePackets => _pendingReliablePackets;
+        internal long PendingReliableBytes => _pendingReliableBytes;
+        internal int PendingReliableFragments => _pendingReliableFragments;
+        internal int PendingReliablePacketsHighWater => _pendingReliablePacketsHighWater;
+        internal long PendingReliableBytesHighWater => _pendingReliableBytesHighWater;
+        internal int PendingReliableFragmentsHighWater => _pendingReliableFragmentsHighWater;
+        internal long EndpointReliableAdmissionRejections => _endpointReliableAdmissionRejections;
+        internal long GlobalReliableAdmissionRejections => _globalReliableAdmissionRejections;
+
+        internal long GlobalReliableBytesLimit => ComputeGlobalReliableBytesLimit(
+            _listener, ActiveEndpointCount, _settings.ReliableSendBytesCapacity);
+        internal int GlobalReliableFragmentsLimit => ComputeGlobalReliableFragmentsLimit(
+            _listener, ActiveEndpointCount, _nativeFragmentAdmissionBudget,
+            PerEndpointManagedFragmentsLimit);
+        internal int GlobalReliablePacketsLimit => ComputeGlobalReliablePacketsLimit(
+            _listener, ActiveEndpointCount, _settings.NativePacketPoolSize,
+            _settings.ReliableSendQueueCapacity);
+
+        private int ActiveEndpointCount => _endpoints.Count <= 0 ? 1 : _endpoints.Count;
+
+        private long PerEndpointManagedFragmentsLimit => Math.Max(
+            (long)_settings.NativeReliableFragmentsCapacity,
+            (long)_settings.ReliableSendQueueCapacity * LiteNetLibLimits.MaximumFragmentsCount);
+
+        /// <summary>Computes a saturating driver-wide managed reliable byte budget.</summary>
+        internal static long ComputeGlobalReliableBytesLimit(bool listener,
+            int activeEndpoints, long perEndpointBytesLimit)
+        {
+            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
+            var scaled = SaturatingMultiply(endpoints, LiteNetLibLimits.MaximumReliableBytes);
+            var value = Math.Min(MaximumGlobalReliableBytes,
+                Math.Max(MinimumGlobalReliableBytes, scaled));
+            return listener ? value : Math.Max(value, perEndpointBytesLimit);
+        }
+
+        /// <summary>Computes a saturating driver-wide managed reliable fragment budget.</summary>
+        internal static int ComputeGlobalReliableFragmentsLimit(bool listener,
+            int activeEndpoints, int nativeFragmentAdmissionBudget,
+            long perEndpointFragmentsLimit)
+        {
+            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
+            var scaled = SaturatingMultiply(endpoints, LiteNetLibLimits.MaximumFragmentsCount);
+            var value = Math.Max(4L * Math.Max(0, nativeFragmentAdmissionBudget), scaled);
+            if (!listener)
+                value = Math.Max(value, perEndpointFragmentsLimit);
+            return value > int.MaxValue ? int.MaxValue : (int)value;
+        }
+
+        /// <summary>Computes a saturating driver-wide managed reliable packet budget.</summary>
+        internal static int ComputeGlobalReliablePacketsLimit(bool listener,
+            int activeEndpoints, int nativePacketPoolSize, long perEndpointPacketsLimit)
+        {
+            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
+            var value = Math.Max(Math.Max(0, nativePacketPoolSize) / 2L, (long)endpoints);
+            if (!listener)
+                value = Math.Max(value, perEndpointPacketsLimit);
+            return value > int.MaxValue ? int.MaxValue : (int)value;
+        }
+
+        /// <summary>Tests one endpoint's floor share of a driver-wide managed limit.</summary>
+        internal static bool IsWithinManagedShare(long globalLimit, int activeEndpoints,
+            long current, long requested)
+        {
+            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
+            return current + requested <= globalLimit / endpoints;
+        }
+
+        /// <summary>Tests the driver-wide aggregate against a managed limit.</summary>
+        internal static bool IsWithinManagedGlobal(long globalLimit, long current, long requested) =>
+            current + requested <= globalLimit;
+
+        private static long SaturatingMultiply(int left, int right) =>
+            Math.Min(long.MaxValue, (long)left * right);
 
         internal bool ThrowOnNextReliableSubmit { get; set; }
 
@@ -686,12 +779,41 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _nativeReliableBytes -= ticket.Bytes;
         }
 
-        internal void RecordPendingHighWater(int packets, long bytes)
+        internal bool TryAdmitManagedReliable(LiteNetLibEndpoint endpoint, int fragments, long bytes)
         {
-            if (packets > _pendingReliablePacketsHighWater)
-                _pendingReliablePacketsHighWater = packets;
-            if (bytes > _pendingReliableBytesHighWater)
-                _pendingReliableBytesHighWater = bytes;
+            var endpoints = ActiveEndpointCount;
+            var packetsLimit = GlobalReliablePacketsLimit;
+            var fragmentsLimit = GlobalReliableFragmentsLimit;
+            var bytesLimit = GlobalReliableBytesLimit;
+            return IsWithinManagedShare(packetsLimit, endpoints,
+                       endpoint.PendingReliablePackets, 1) &&
+                   IsWithinManagedShare(fragmentsLimit, endpoints,
+                       endpoint.PendingReliableFragments, fragments) &&
+                   IsWithinManagedShare(bytesLimit, endpoints,
+                       endpoint.PendingReliableBytes, bytes) &&
+                   IsWithinManagedGlobal(packetsLimit, _pendingReliablePackets, 1) &&
+                   IsWithinManagedGlobal(fragmentsLimit, _pendingReliableFragments, fragments) &&
+                   IsWithinManagedGlobal(bytesLimit, _pendingReliableBytes, bytes);
+        }
+
+        internal void ReserveManagedReliable(int fragments, long bytes)
+        {
+            _pendingReliablePackets++;
+            _pendingReliableFragments += fragments;
+            _pendingReliableBytes += bytes;
+            if (_pendingReliablePackets > _pendingReliablePacketsHighWater)
+                _pendingReliablePacketsHighWater = _pendingReliablePackets;
+            if (_pendingReliableFragments > _pendingReliableFragmentsHighWater)
+                _pendingReliableFragmentsHighWater = _pendingReliableFragments;
+            if (_pendingReliableBytes > _pendingReliableBytesHighWater)
+                _pendingReliableBytesHighWater = _pendingReliableBytes;
+        }
+
+        internal void ReleaseManagedReliable(int fragments, long bytes)
+        {
+            _pendingReliablePackets--;
+            _pendingReliableFragments -= fragments;
+            _pendingReliableBytes -= bytes;
         }
 
         internal int GetMaxUnreliableBytes(LiteNetLibEndpoint endpoint)
@@ -860,11 +982,20 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _malformedPackets++;
         }
 
-        internal void RecordReliableQueueOverflow()
+        internal void RecordEndpointReliableQueueOverflow()
         {
             _dropped++;
             _sendFailures++;
             _reliableSendQueueOverflows++;
+            _endpointReliableAdmissionRejections++;
+        }
+
+        internal void RecordGlobalReliableQueueOverflow()
+        {
+            _dropped++;
+            _sendFailures++;
+            _reliableSendQueueOverflows++;
+            _globalReliableAdmissionRejections++;
         }
 
         private void ObserveNativePacketPool()
@@ -886,14 +1017,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         internal LiteNetLibDiagnostics CaptureDiagnostics()
         {
-            var pendingPackets = 0;
-            long pendingBytes = 0;
             var queuedPackets = 0;
             var nativeQueuePackets = 0;
             foreach (var endpoint in _endpoints.Values)
             {
-                pendingPackets += endpoint.PendingReliablePackets;
-                pendingBytes += endpoint.PendingReliableBytes;
                 queuedPackets += endpoint.QueuedPackets;
                 if (!endpoint.IsDisposed)
                     nativeQueuePackets += endpoint.Peer.GetPacketsCountInReliableQueue(0, true);
@@ -917,11 +1044,15 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 MalformedPackets = _malformedPackets,
                 SendFailures = _sendFailures,
                 Disconnects = _disconnects,
-                PendingReliablePackets = pendingPackets,
-                PendingReliableBytes = pendingBytes,
+                PendingReliablePackets = _pendingReliablePackets,
+                PendingReliableBytes = _pendingReliableBytes,
                 PendingReliablePacketsHighWater = _pendingReliablePacketsHighWater,
                 PendingReliableBytesHighWater = _pendingReliableBytesHighWater,
+                PendingReliableFragments = _pendingReliableFragments,
+                PendingReliableFragmentsHighWater = _pendingReliableFragmentsHighWater,
                 ReliableSendQueueOverflows = _reliableSendQueueOverflows,
+                EndpointReliableAdmissionRejections = _endpointReliableAdmissionRejections,
+                GlobalReliableAdmissionRejections = _globalReliableAdmissionRejections,
                 QueuedPackets = queuedPackets,
                 OutstandingLeases = buffers.OutstandingLeases,
                 NativeReliableFragments = _nativeReliableFragments,
@@ -1069,6 +1200,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private bool _disposed;
         private bool _overflowDisconnected;
         private long _pendingReliableBytes;
+        private int _pendingReliableFragments;
         private int _nativeReliableFragments;
         private long _nativeReliableBytes;
         private int _pendingSnapshotChunks;
@@ -1090,6 +1222,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal int QueuedPackets => _incoming.Count;
         internal int PendingReliablePackets => _pendingReliable.Count;
         internal long PendingReliableBytes => _pendingReliableBytes;
+        internal int PendingReliableFragments => _pendingReliableFragments;
+        internal int PendingSnapshotChunks => _pendingSnapshotChunks;
+        internal uint PendingSnapshotTick => _pendingSnapshotTick;
         internal int NativeReliableFragments => _nativeReliableFragments;
         internal long NativeReliableBytes => _nativeReliableBytes;
         internal int MaxUnreliablePayloadBytes => _owner.GetMaxUnreliableBytes(this);
@@ -1148,13 +1283,19 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             if (_pendingReliable.Count >= _owner.Settings.ReliableSendQueueCapacity ||
                 _pendingReliableBytes > _owner.Settings.ReliableSendBytesCapacity - packet.Length)
             {
-                _owner.RecordReliableQueueOverflow();
+                _owner.RecordEndpointReliableQueueOverflow();
                 return false;
             }
+            if (!_owner.TryAdmitManagedReliable(this, fragments, packet.Length))
+            {
+                _owner.RecordGlobalReliableQueueOverflow();
+                return false;
+            }
+            _owner.ReserveManagedReliable(fragments, packet.Length);
             TrackSnapshot(header);
             _pendingReliable.Enqueue(new PendingReliable(packet, header, fragments));
             _pendingReliableBytes += packet.Length;
-            _owner.RecordPendingHighWater(_pendingReliable.Count, _pendingReliableBytes);
+            _pendingReliableFragments += fragments;
             return true;
         }
 
@@ -1167,6 +1308,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 return false;
             _pendingReliable.Dequeue();
             _pendingReliableBytes -= next.Packet.Length;
+            _pendingReliableFragments -= next.Fragments;
+            _owner.ReleaseManagedReliable(next.Fragments, next.Packet.Length);
             _owner.SubmitQueuedReliable(this, next.Packet, next.Header, next.Fragments);
             return true;
         }
@@ -1237,11 +1380,14 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             while (_pendingReliable.Count > 0)
             {
                 var pending = _pendingReliable.Dequeue();
+                _pendingReliableFragments -= pending.Fragments;
+                _owner.ReleaseManagedReliable(pending.Fragments, pending.Packet.Length);
                 pending.Packet.Dispose();
                 if (pending.Header.Kind == PacketKind.SnapshotChunk)
                     ReleaseSnapshotCount();
             }
             _pendingReliableBytes = 0;
+            _pendingReliableFragments = 0;
             if (_tickets.Count > 0)
             {
                 var tickets = new List<LiteNetLibDriver.DeliveryTicket>(_tickets);
