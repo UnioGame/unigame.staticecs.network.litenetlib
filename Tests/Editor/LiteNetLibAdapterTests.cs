@@ -2423,6 +2423,245 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             }
         }
 
+        [Test]
+        public void ReliablePreflightMirrorsNativeAndManagedAdmission()
+        {
+            var packetBytes = PacketHeader.Size + 32;
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.ReliableSendQueueCapacity = 2;
+            settings.ReliableSendBytesCapacity = packetBytes * 8L;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(
+                           NetworkBufferPool.DefaultServerRetainedBytes))
+                {
+                    // Fresh endpoint: native direct admission is available.
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.True);
+                    var probe = server.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.True);
+                    Assert.That(endpoint.CanAcceptReliablePacket(
+                        LiteNetLibLimits.MaximumReliableBytes + 1), Is.False);
+                    Assert.That(endpoint.CanAcceptReliablePacket(
+                        PacketHeader.Size - 1), Is.False);
+                    AssertPreflightDiagnosticsUnchanged(probe,
+                        server.CaptureDiagnostics());
+
+                    Assert.That(endpoint.TrySend(CreatePacket(pool,
+                        PacketKind.Ping, PacketFlags.ReliableOrdered, 32)),
+                        Is.True);
+                    Assert.That(endpoint.PendingReliablePackets, Is.Zero,
+                        "the first reliable packet uses native direct admission");
+
+                    // Native capacity is saturated: the managed queue must admit.
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.True);
+                    Assert.That(endpoint.TrySend(CreatePacket(pool,
+                        PacketKind.Ping, PacketFlags.ReliableOrdered, 32)),
+                        Is.True);
+                    Assert.That(endpoint.PendingReliablePackets,
+                        Is.EqualTo(1));
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.True);
+                    Assert.That(endpoint.TrySend(CreatePacket(pool,
+                        PacketKind.Ping, PacketFlags.ReliableOrdered, 32)),
+                        Is.True);
+                    Assert.That(endpoint.PendingReliablePackets,
+                        Is.EqualTo(2));
+
+                    // The endpoint FIFO is full: preflight must reject without mutation.
+                    var full = server.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.False);
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.False);
+                    AssertPreflightDiagnosticsUnchanged(full,
+                        server.CaptureDiagnostics());
+
+                    endpoint.Dispose();
+                    Assert.That(server.CaptureDiagnostics().OutstandingLeases,
+                        Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void ReliablePreflightHonorsEndpointByteAndSizeLimits()
+        {
+            var packetBytes = PacketHeader.Size + 32;
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.ReliableSendQueueCapacity = 16;
+            settings.ReliableSendBytesCapacity = packetBytes;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(
+                           NetworkBufferPool.DefaultServerRetainedBytes))
+                {
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.True);
+                    Assert.That(endpoint.TrySend(CreatePacket(pool,
+                        PacketKind.Ping, PacketFlags.ReliableOrdered, 32)),
+                        Is.True);
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.True);
+                    Assert.That(endpoint.TrySend(CreatePacket(pool,
+                        PacketKind.Ping, PacketFlags.ReliableOrdered, 32)),
+                        Is.True);
+                    Assert.That(endpoint.PendingReliableBytes,
+                        Is.EqualTo(packetBytes));
+
+                    var full = server.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.False,
+                        "the endpoint reliable byte budget must reject growth");
+                    Assert.That(endpoint.CanAcceptReliablePacket(0), Is.False);
+                    Assert.That(endpoint.CanAcceptReliablePacket(
+                        LiteNetLibLimits.MaximumReliableBytes + 1), Is.False);
+                    AssertPreflightDiagnosticsUnchanged(full,
+                        server.CaptureDiagnostics());
+
+                    endpoint.Dispose();
+                    Assert.That(server.CaptureDiagnostics().OutstandingLeases,
+                        Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void ReliablePreflightHonorsGlobalManagedPacketLimit()
+        {
+            var packetBytes = PacketHeader.Size + 32;
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.MaximumConnections = 1;
+            settings.NativePacketPoolSize = 1000;
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.ReceiveQueueCapacity = 600;
+            settings.ReliableSendQueueCapacity = 600;
+            settings.ReliableSendBytesCapacity = packetBytes * 600L;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                var driver = server.Driver;
+                using (var pool = new NetworkBufferPool(
+                           NetworkBufferPool.DefaultServerRetainedBytes))
+                {
+                    Assert.That(driver.GlobalReliablePacketsLimit,
+                        Is.EqualTo(500));
+                    Assert.That(endpoint.TrySend(CreatePacket(pool,
+                        PacketKind.Ping, PacketFlags.ReliableOrdered, 32)),
+                        Is.True);
+                    Assert.That(endpoint.PendingReliablePackets, Is.Zero,
+                        "native direct admission must precede the managed budget");
+                    for (var i = 0; i < driver.GlobalReliablePacketsLimit; i++)
+                    {
+                        Assert.That(endpoint.TrySend(CreatePacket(pool,
+                            PacketKind.Ping, PacketFlags.ReliableOrdered, 32)),
+                            Is.True);
+                    }
+                    Assert.That(endpoint.PendingReliablePackets,
+                        Is.EqualTo(driver.GlobalReliablePacketsLimit));
+
+                    var full = server.CaptureDiagnostics();
+                    Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                        Is.False,
+                        "the driver-wide managed packet budget must reject growth");
+                    AssertPreflightDiagnosticsUnchanged(full,
+                        server.CaptureDiagnostics());
+
+                    endpoint.Dispose();
+                    Assert.That(server.CaptureDiagnostics().OutstandingLeases,
+                        Is.Zero);
+                    Assert.That(driver.PendingReliablePackets, Is.Zero);
+                    Assert.That(driver.PendingReliableFragments, Is.Zero);
+                    Assert.That(driver.PendingReliableBytes, Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void ReliablePreflightRejectsDisconnectedAndDisposedEndpoints()
+        {
+            var packetBytes = PacketHeader.Size + 32;
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                    Is.True);
+
+                endpoint.DisconnectFromOverflow();
+                Assert.That(endpoint.IsConnected, Is.False);
+                Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                    Is.False);
+
+                endpoint.Dispose();
+                Assert.That(endpoint.CanAcceptReliablePacket(packetBytes),
+                    Is.False);
+                Assert.That(server.CaptureDiagnostics().OutstandingLeases,
+                    Is.Zero);
+            }
+        }
+
+        private static void AssertPreflightDiagnosticsUnchanged(
+            LiteNetLibDiagnostics before, LiteNetLibDiagnostics after)
+        {
+            Assert.That(after.PendingReliablePackets,
+                Is.EqualTo(before.PendingReliablePackets));
+            Assert.That(after.PendingReliableFragments,
+                Is.EqualTo(before.PendingReliableFragments));
+            Assert.That(after.PendingReliableBytes,
+                Is.EqualTo(before.PendingReliableBytes));
+            Assert.That(after.PendingReliablePacketsHighWater,
+                Is.EqualTo(before.PendingReliablePacketsHighWater));
+            Assert.That(after.PendingReliableFragmentsHighWater,
+                Is.EqualTo(before.PendingReliableFragmentsHighWater));
+            Assert.That(after.PendingReliableBytesHighWater,
+                Is.EqualTo(before.PendingReliableBytesHighWater));
+            Assert.That(after.NativeReliableFragments,
+                Is.EqualTo(before.NativeReliableFragments));
+            Assert.That(after.NativeReliableBytes,
+                Is.EqualTo(before.NativeReliableBytes));
+            Assert.That(after.NativeReliableFragmentsHighWater,
+                Is.EqualTo(before.NativeReliableFragmentsHighWater));
+            Assert.That(after.NativeReliableBytesHighWater,
+                Is.EqualTo(before.NativeReliableBytesHighWater));
+            Assert.That(after.DroppedPackets,
+                Is.EqualTo(before.DroppedPackets));
+            Assert.That(after.SendFailures,
+                Is.EqualTo(before.SendFailures));
+            Assert.That(after.ReliableSendQueueOverflows,
+                Is.EqualTo(before.ReliableSendQueueOverflows));
+            Assert.That(after.EndpointReliableAdmissionRejections,
+                Is.EqualTo(before.EndpointReliableAdmissionRejections));
+            Assert.That(after.GlobalReliableAdmissionRejections,
+                Is.EqualTo(before.GlobalReliableAdmissionRejections));
+            Assert.That(after.SentPackets,
+                Is.EqualTo(before.SentPackets));
+            Assert.That(after.OutstandingLeases,
+                Is.EqualTo(before.OutstandingLeases));
+        }
+
         private static void SendReliableEndpointBurst(LiteNetLibEndpoint endpoint,
             NetworkBufferPool pool, int count, int payloadBytes)
         {

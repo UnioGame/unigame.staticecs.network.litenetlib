@@ -613,13 +613,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             NetworkBufferLease packet, PacketHeader header, out bool transferred)
         {
             transferred = false;
-            if (packet.Length > LiteNetLibLimits.MaximumReliableBytes)
-            {
-                RejectSend();
-                return false;
-            }
-            var fragments = FragmentCount(packet.Length);
-            if (fragments > LiteNetLibLimits.MaximumFragmentsCount)
+            if (!IsReliablePacketSizeAdmissible(packet.Length, out var fragments))
             {
                 RejectSend();
                 return false;
@@ -711,6 +705,39 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private static int FragmentCount(int bytes) =>
             (bytes + LiteNetLibLimits.ReliableFragmentPayloadBytes - 1) /
             LiteNetLibLimits.ReliableFragmentPayloadBytes;
+
+        // Shared by actual send and preflight so the reliable size envelope
+        // and fragment classification cannot drift.
+        private static bool IsReliablePacketSizeAdmissible(int packetBytes,
+            out int fragments)
+        {
+            fragments = 0;
+            if (packetBytes < PacketHeader.Size ||
+                packetBytes > LiteNetLibLimits.MaximumReliableBytes)
+                return false;
+            fragments = FragmentCount(packetBytes);
+            return fragments <= LiteNetLibLimits.MaximumFragmentsCount;
+        }
+
+        /// <summary>
+        /// Side-effect-free prediction of <see cref="TrySendReliable"/> admission.
+        /// It mirrors the pending-FIFO, native-direct, and managed-queue branches
+        /// without reserving capacity, so callers may still lose a subsequent race.
+        /// </summary>
+        internal bool CanAcceptReliablePacket(LiteNetLibEndpoint endpoint,
+            int packetBytes)
+        {
+            if (_disposed || endpoint.IsDisposed || !endpoint.IsConnected)
+                return false;
+            if (!IsReliablePacketSizeAdmissible(packetBytes, out var fragments))
+                return false;
+            if (endpoint.PendingReliablePackets > 0)
+                return endpoint.ClassifyQueueAdmission(packetBytes, fragments) ==
+                    LiteNetLibEndpoint.QueueAdmission.Accepted;
+            return CanRegisterNative(endpoint, fragments, packetBytes) ||
+                endpoint.ClassifyQueueAdmission(packetBytes, fragments) ==
+                    LiteNetLibEndpoint.QueueAdmission.Accepted;
+        }
 
         private void DrainReliableEndpoints()
         {
@@ -1200,7 +1227,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         }
     }
 
-    internal sealed class LiteNetLibEndpoint : INetworkTransport
+    internal sealed class LiteNetLibEndpoint : INetworkTransport,
+        INetworkReliableSendPreflight
     {
         private readonly LiteNetLibDriver _owner;
         private readonly Queue<NetworkBufferLease> _incoming;
@@ -1241,6 +1269,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal int MaxUnreliablePayloadBytes => _owner.GetMaxUnreliableBytes(this);
         public int MaxReliablePayloadBytes => LiteNetLibLimits.MaximumReliableBytes;
         public bool TrySend(NetworkBufferLease packet) => _owner.TrySend(this, packet);
+        public bool CanAcceptReliablePacket(int packetBytes) =>
+            _owner.CanAcceptReliablePacket(this, packetBytes);
 
         int INetworkTransportCapabilities.MaxUnreliablePayloadBytes => MaxUnreliablePayloadBytes;
 
@@ -1289,15 +1319,34 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _pendingSnapshotChunks++;
         }
 
-        internal bool TryQueue(NetworkBufferLease packet, PacketHeader header, int fragments)
+        internal enum QueueAdmission
+        {
+            Accepted = 0,
+            EndpointFull = 1,
+            GlobalFull = 2,
+        }
+
+        /// <summary>Classifies managed FIFO admission without mutating any counter or lease.</summary>
+        internal QueueAdmission ClassifyQueueAdmission(int packetLength,
+            int fragments)
         {
             if (_pendingReliable.Count >= _owner.Settings.ReliableSendQueueCapacity ||
-                _pendingReliableBytes > _owner.Settings.ReliableSendBytesCapacity - packet.Length)
+                _pendingReliableBytes > _owner.Settings.ReliableSendBytesCapacity - packetLength)
+                return QueueAdmission.EndpointFull;
+            if (!_owner.TryAdmitManagedReliable(this, fragments, packetLength))
+                return QueueAdmission.GlobalFull;
+            return QueueAdmission.Accepted;
+        }
+
+        internal bool TryQueue(NetworkBufferLease packet, PacketHeader header, int fragments)
+        {
+            var admission = ClassifyQueueAdmission(packet.Length, fragments);
+            if (admission == QueueAdmission.EndpointFull)
             {
                 _owner.RecordEndpointReliableQueueOverflow();
                 return false;
             }
-            if (!_owner.TryAdmitManagedReliable(this, fragments, packet.Length))
+            if (admission == QueueAdmission.GlobalFull)
             {
                 _owner.RecordGlobalReliableQueueOverflow();
                 return false;
