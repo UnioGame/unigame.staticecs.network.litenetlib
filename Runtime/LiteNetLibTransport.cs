@@ -360,15 +360,18 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal long GlobalReliableAdmissionRejections => _globalReliableAdmissionRejections;
 
         internal long GlobalReliableBytesLimit => ComputeGlobalReliableBytesLimit(
-            _listener, ActiveEndpointCount, _settings.ReliableSendBytesCapacity);
+            _listener, AdmissionDenominator, _settings.ReliableSendBytesCapacity);
         internal int GlobalReliableFragmentsLimit => ComputeGlobalReliableFragmentsLimit(
-            _listener, ActiveEndpointCount, _nativeFragmentAdmissionBudget,
+            _listener, AdmissionDenominator, _nativeFragmentAdmissionBudget,
             PerEndpointManagedFragmentsLimit);
         internal int GlobalReliablePacketsLimit => ComputeGlobalReliablePacketsLimit(
-            _listener, ActiveEndpointCount, _settings.NativePacketPoolSize,
+            _listener, AdmissionDenominator, _settings.NativePacketPoolSize,
             _settings.ReliableSendQueueCapacity);
 
-        private int ActiveEndpointCount => _endpoints.Count <= 0 ? 1 : _endpoints.Count;
+        // A listener reserves a fixed floor share for its configured connection capacity from startup,
+        // so admission is independent of how many peers happen to be connected. A client is a single
+        // endpoint and therefore always divides by one.
+        private int AdmissionDenominator => _listener ? Math.Max(1, _settings.MaximumConnections) : 1;
 
         private long PerEndpointManagedFragmentsLimit => Math.Max(
             (long)_settings.NativeReliableFragmentsCapacity,
@@ -376,10 +379,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         /// <summary>Computes a saturating driver-wide managed reliable byte budget.</summary>
         internal static long ComputeGlobalReliableBytesLimit(bool listener,
-            int activeEndpoints, long perEndpointBytesLimit)
+            int configuredCapacity, long perEndpointBytesLimit)
         {
-            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
-            var scaled = SaturatingMultiply(endpoints, LiteNetLibLimits.MaximumReliableBytes);
+            var capacity = configuredCapacity <= 0 ? 1 : configuredCapacity;
+            var scaled = SaturatingMultiply(capacity, LiteNetLibLimits.MaximumReliableBytes);
             var value = Math.Min(MaximumGlobalReliableBytes,
                 Math.Max(MinimumGlobalReliableBytes, scaled));
             return listener ? value : Math.Max(value, perEndpointBytesLimit);
@@ -387,11 +390,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         /// <summary>Computes a saturating driver-wide managed reliable fragment budget.</summary>
         internal static int ComputeGlobalReliableFragmentsLimit(bool listener,
-            int activeEndpoints, int nativeFragmentAdmissionBudget,
+            int configuredCapacity, int nativeFragmentAdmissionBudget,
             long perEndpointFragmentsLimit)
         {
-            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
-            var scaled = SaturatingMultiply(endpoints, LiteNetLibLimits.MaximumFragmentsCount);
+            var capacity = configuredCapacity <= 0 ? 1 : configuredCapacity;
+            var scaled = SaturatingMultiply(capacity, LiteNetLibLimits.MaximumFragmentsCount);
             var value = Math.Max(4L * Math.Max(0, nativeFragmentAdmissionBudget), scaled);
             if (!listener)
                 value = Math.Max(value, perEndpointFragmentsLimit);
@@ -400,26 +403,34 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         /// <summary>Computes a saturating driver-wide managed reliable packet budget.</summary>
         internal static int ComputeGlobalReliablePacketsLimit(bool listener,
-            int activeEndpoints, int nativePacketPoolSize, long perEndpointPacketsLimit)
+            int configuredCapacity, int nativePacketPoolSize, long perEndpointPacketsLimit)
         {
-            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
-            var value = Math.Max(Math.Max(0, nativePacketPoolSize) / 2L, (long)endpoints);
+            var capacity = configuredCapacity <= 0 ? 1 : configuredCapacity;
+            var value = Math.Max(Math.Max(0, nativePacketPoolSize) / 2L, (long)capacity);
             if (!listener)
                 value = Math.Max(value, perEndpointPacketsLimit);
             return value > int.MaxValue ? int.MaxValue : (int)value;
         }
 
         /// <summary>Tests one endpoint's floor share of a driver-wide managed limit.</summary>
-        internal static bool IsWithinManagedShare(long globalLimit, int activeEndpoints,
+        internal static bool IsWithinManagedShare(long globalLimit, int divisor,
             long current, long requested)
         {
-            var endpoints = activeEndpoints <= 0 ? 1 : activeEndpoints;
-            return current + requested <= globalLimit / endpoints;
+            if (globalLimit < 0)
+                return false;
+            var endpoints = divisor <= 0 ? 1 : divisor;
+            return IsWithinManagedLimit(globalLimit / endpoints, current, requested);
         }
 
         /// <summary>Tests the driver-wide aggregate against a managed limit.</summary>
         internal static bool IsWithinManagedGlobal(long globalLimit, long current, long requested) =>
-            current + requested <= globalLimit;
+            IsWithinManagedLimit(globalLimit, current, requested);
+
+        // Rejects negative inputs and avoids current + requested overflow by proving the request
+        // fits in the remaining headroom instead of forming the sum.
+        private static bool IsWithinManagedLimit(long limit, long current, long requested) =>
+            limit >= 0 && current >= 0 && requested >= 0 &&
+            current <= limit && requested <= limit - current;
 
         private static long SaturatingMultiply(int left, int right) =>
             Math.Min(long.MaxValue, (long)left * right);
@@ -781,7 +792,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         internal bool TryAdmitManagedReliable(LiteNetLibEndpoint endpoint, int fragments, long bytes)
         {
-            var endpoints = ActiveEndpointCount;
+            var endpoints = AdmissionDenominator;
             var packetsLimit = GlobalReliablePacketsLimit;
             var fragmentsLimit = GlobalReliableFragmentsLimit;
             var bytesLimit = GlobalReliableBytesLimit;
