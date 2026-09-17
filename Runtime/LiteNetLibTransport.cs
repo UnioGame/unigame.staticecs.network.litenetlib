@@ -1228,7 +1228,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
     }
 
     internal sealed class LiteNetLibEndpoint : INetworkTransport,
-        INetworkReliableSendPreflight
+        INetworkReliableSendPreflight,
+        INetworkReliableSendState
     {
         private readonly LiteNetLibDriver _owner;
         private readonly Queue<NetworkBufferLease> _incoming;
@@ -1266,6 +1267,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal uint PendingSnapshotTick => _pendingSnapshotTick;
         internal int NativeReliableFragments => _nativeReliableFragments;
         internal long NativeReliableBytes => _nativeReliableBytes;
+        bool INetworkReliableSendState.HasPendingReliablePackets =>
+            _pendingReliable.Count > 0 || _nativeReliableBytes > 0;
         internal int MaxUnreliablePayloadBytes => _owner.GetMaxUnreliableBytes(this);
         public int MaxReliablePayloadBytes => LiteNetLibLimits.MaximumReliableBytes;
         public bool TrySend(NetworkBufferLease packet) => _owner.TrySend(this, packet);
