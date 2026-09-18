@@ -61,6 +61,17 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public long NativeReliableBytesCapacity;
         /// <summary>Native LiteNetLib packet pool size; zero selects a role-based default.</summary>
         public int NativePacketPoolSize;
+        /// <summary>
+        /// When true, starts LiteNetLib's own receive and logic threads (<c>NetManager.Start</c>) so socket
+        /// reads, resend/ping timers, and queued sends run off the calling thread; when false (default),
+        /// runs LiteNetLib in manual mode (<c>NetManager.StartInManualMode</c>) and pumps sockets synchronously
+        /// on the caller, matching all behaviour before this option existed. In both modes,
+        /// <c>UnsyncedEvents</c>/<c>UnsyncedReceiveEvent</c>/<c>UnsyncedDeliveryEvent</c> stay false, so every
+        /// <c>INetEventListener</c> callback (accept, receive, delivery, disconnect) still runs only from the
+        /// calling thread's <c>Update()</c>/<c>PollEvents()</c> call; only native socket I/O and LiteNetLib's own
+        /// resend/ping scheduling move to its background threads.
+        /// </summary>
+        public bool ThreadedIo;
 
         /// <summary>Gets conservative defaults for one separated endpoint.</summary>
         public static LiteNetLibSettings Default => new LiteNetLibSettings
@@ -272,6 +283,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
     {
         private readonly LiteNetLibSettings _settings;
         private readonly bool _listener;
+        private readonly bool _threadedIo;
         private readonly NetworkBufferPool _pool;
         private readonly NetManager _manager;
         private readonly Dictionary<NetPeer, LiteNetLibEndpoint> _endpoints =
@@ -444,6 +456,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         {
             _settings = settings;
             _listener = listener;
+            _threadedIo = settings.ThreadedIo;
             _nativeFragmentAdmissionBudget =
                 ComputeNativeFragmentAdmissionBudget(settings.NativePacketPoolSize);
             var drainCapacity = settings.MaximumConnections <= 0
@@ -468,6 +481,15 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 UnsyncedReceiveEvent = false,
                 UnsyncedDeliveryEvent = false,
             };
+            if (_threadedIo)
+            {
+                // TriggerUpdate() wakes the logic thread immediately after every Flush(), so this
+                // interval is only a fallback cadence (e.g. between ticks); Windows Thread.Sleep
+                // precision (~15 ms by default) means values this low mostly matter as "as fast as
+                // the OS scheduler allows", not as an exact period. See LiteNetLib's own doc comment
+                // on NetManager.UpdateTime.
+                _manager.UpdateTime = 1;
+            }
             try
             {
                 var ipv4 = IPAddress.Any;
@@ -482,8 +504,13 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                         ? address : IPAddress.IPv6Any;
                     port = settings.Port;
                 }
-                if (!_manager.StartInManualMode(ipv4, ipv6, port))
-                    throw new InvalidOperationException("Unable to start LiteNetLib manual mode.");
+                var started = _threadedIo
+                    ? _manager.Start(ipv4, ipv6, port)
+                    : _manager.StartInManualMode(ipv4, ipv6, port);
+                if (!started)
+                    throw new InvalidOperationException(_threadedIo
+                        ? "Unable to start LiteNetLib threaded mode."
+                        : "Unable to start LiteNetLib manual mode.");
                 if (!listener)
                 {
                     var peer = _manager.Connect(settings.Address, settings.Port, string.Empty);
@@ -506,6 +533,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal INetworkTransport ClientEndpoint => _clientEndpoint;
         internal bool Connected => _clientEndpoint != null && _clientEndpoint.IsConnected;
         internal LiteNetLibSettings Settings => _settings;
+        internal bool ThreadedIo => _threadedIo;
 
         internal void Update()
         {
@@ -518,15 +546,32 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal void Flush()
         {
             ThrowIfDisposed();
-            using var drainScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.ReliableDrain);
-            DrainReliableEndpoints();
-            var now = _clock.ElapsedTicks;
-            var elapsed = (float)((now - _lastPumpTicks) * 1000.0 / Stopwatch.Frequency);
-            _lastPumpTicks = now;
-            if (elapsed <= 0)
-                elapsed = 0.001f;
-            using var nativeScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.NativeUpdate);
-            _manager.ManualUpdate(elapsed);
+            // Each phase is measured in its own block (not a using-declaration spanning the rest of
+            // the method) so "ReliableDrain" reports only the adapter FIFO promotion loop and
+            // "NativeUpdate" reports only the LiteNetLib call below, with no overlap between the two.
+            using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.ReliableDrain))
+            {
+                DrainReliableEndpoints();
+            }
+            using (NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.NativeUpdate))
+            {
+                if (_threadedIo)
+                {
+                    // The logic thread owns resends, pings, and the actual socket send; this only
+                    // wakes it so queued sends go out right after this tick instead of waiting for
+                    // its own UpdateTime cadence.
+                    _manager.TriggerUpdate();
+                }
+                else
+                {
+                    var now = _clock.ElapsedTicks;
+                    var elapsed = (float)((now - _lastPumpTicks) * 1000.0 / Stopwatch.Frequency);
+                    _lastPumpTicks = now;
+                    if (elapsed <= 0)
+                        elapsed = 0.001f;
+                    _manager.ManualUpdate(elapsed);
+                }
+            }
             ObserveNativePacketPool();
         }
 

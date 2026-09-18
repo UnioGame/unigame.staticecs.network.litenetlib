@@ -2998,5 +2998,225 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             using (var socket = new UdpClient(0))
                 return checked((ushort)((IPEndPoint)socket.Client.LocalEndPoint).Port);
         }
+
+        [Test]
+        public void ThreadedIoDefaultsToFalseAndSurvivesNormalize()
+        {
+            Assert.That(LiteNetLibSettings.Default.ThreadedIo, Is.False);
+            Assert.That(LiteNetLibSettings.Default.Normalize(false).ThreadedIo, Is.False);
+            Assert.That(LiteNetLibSettings.Default.Normalize(true).ThreadedIo, Is.False);
+
+            var enabled = LiteNetLibSettings.Default;
+            enabled.ThreadedIo = true;
+            Assert.That(enabled.Normalize(false).ThreadedIo, Is.True);
+            Assert.That(enabled.Normalize(true).ThreadedIo, Is.True);
+        }
+
+        [Test]
+        public void ManualModeDriverReportsThreadedIoDisabled()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                Assert.That(server.Driver.ThreadedIo, Is.False);
+                Assert.That(client.Driver.ThreadedIo, Is.False);
+            }
+        }
+
+        [Test]
+        public void ThreadedIoLoopbackDeliversSequencedAndReliablePackets()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ThreadedIo = true;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                Assert.That(server.Driver.ThreadedIo, Is.True);
+                Assert.That(client.Driver.ThreadedIo, Is.True);
+
+                var serverEndpoint = WaitForAccept(server, client);
+                Assert.That(client.Connected, Is.True);
+
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var sequenced = CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.UnreliableSequenced, 32);
+                    Assert.That(client.Endpoint.TrySend(sequenced), Is.True);
+                    var receivedSequenced = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(receivedSequenced, PacketKind.Ping,
+                        PacketFlags.UnreliableSequenced, 32);
+                    receivedSequenced.Dispose();
+
+                    var callbacksBefore = client.CaptureDiagnostics().DeliveryCallbacks;
+                    var reliable = CreatePacket(pool, PacketKind.TransactionCommand,
+                        PacketFlags.ReliableOrdered, 15000);
+                    Assert.That(client.Endpoint.TrySend(reliable), Is.True);
+                    var receivedReliable = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(receivedReliable, PacketKind.TransactionCommand,
+                        PacketFlags.ReliableOrdered, 15000);
+                    receivedReliable.Dispose();
+                    WaitForDeliveryAtLeast(server, client, callbacksBefore + 1);
+
+                    var diagnostics = client.CaptureDiagnostics();
+                    Assert.That(diagnostics.ReliableSentPackets, Is.GreaterThanOrEqualTo(1));
+                    Assert.That(diagnostics.UnreliableSentPackets, Is.GreaterThanOrEqualTo(1));
+                    Assert.That(diagnostics.NativeReliableBytes, Is.Zero);
+                    Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
+                    Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
+                }
+            }
+        }
+
+        [Test]
+        public void ThreadedIoReliableFifoRetainsLeaseUntilNativeCapacityIsAvailable()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.ThreadedIo = true;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Pong,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+
+                    var staged = client.CaptureDiagnostics();
+                    Assert.That(staged.PendingReliablePackets, Is.EqualTo(1));
+                    Assert.That(staged.PendingReliableBytes,
+                        Is.EqualTo(PacketHeader.Size + 32));
+
+                    var first = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(first, PacketKind.Ping, PacketFlags.ReliableOrdered, 32);
+                    first.Dispose();
+                    var second = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(second, PacketKind.Pong, PacketFlags.ReliableOrdered, 32);
+                    second.Dispose();
+
+                    WaitForDelivery(server, client);
+                    var complete = client.CaptureDiagnostics();
+                    Assert.That(complete.PendingReliablePackets, Is.Zero);
+                    Assert.That(complete.PendingReliableBytes, Is.Zero);
+                    Assert.That(complete.NativeReliableFragments, Is.Zero);
+                    Assert.That(complete.NativeReliableBytes, Is.Zero);
+                    Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
+                    Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
+                }
+            }
+        }
+
+        [Test]
+        public void ThreadedIoSharedAdmissionBudgetBoundsNativeFragmentsAndProtectsPool()
+        {
+            const int BurstCount = 1100;
+            const int PayloadBytes = 32;
+            var packetBytes = PacketHeader.Size + PayloadBytes;
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ReceiveQueueCapacity = BurstCount + 64;
+            settings.NativePacketPoolSize = 1000;
+            settings.NativeReliableFragmentsCapacity = BurstCount + 64;
+            settings.NativeReliableBytesCapacity = packetBytes * (long)(BurstCount + 64);
+            settings.ReliableSendQueueCapacity = BurstCount + 64;
+            settings.ReliableSendBytesCapacity = packetBytes * (long)(BurstCount + 64);
+            settings.ThreadedIo = true;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                var driver = client.Driver;
+                var budget = driver.NativeFragmentAdmissionBudget;
+                Assert.That(budget, Is.EqualTo(750));
+                Assert.That(budget, Is.LessThan(BurstCount));
+
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var callbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                    Assert.That(SendReliableBurst(client, pool, BurstCount, PayloadBytes, null),
+                        Is.EqualTo(BurstCount));
+
+                    var staged = client.CaptureDiagnostics();
+                    Assert.That(staged.NativeReliableFragments, Is.EqualTo(budget));
+                    Assert.That(staged.PendingReliablePackets, Is.EqualTo(BurstCount - budget));
+
+                    DrainReliableBurst(server, client, serverEndpoint, BurstCount,
+                        callbacks + BurstCount);
+
+                    var complete = client.CaptureDiagnostics();
+                    Assert.That(complete.NativeReliableFragments, Is.Zero);
+                    Assert.That(complete.NativeReliableBytes, Is.Zero);
+                    Assert.That(complete.PendingReliablePackets, Is.Zero);
+                    Assert.That(complete.OutstandingLeases, Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void ThreadedIoDisconnectIsObservedByServerAndClient()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.ThreadedIo = true;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                serverEndpoint.Dispose();
+                WaitForDisconnect(server, client);
+                Assert.That(server.CaptureDiagnostics().Connections, Is.Zero);
+            }
+        }
+
+        [Test]
+        public void ThreadedIoClientCanTalkToManualModeServer()
+        {
+            var port = FindFreePort();
+            var serverSettings = LiteNetLibSettings.Default;
+            serverSettings.Address = "127.0.0.1";
+            serverSettings.Port = port;
+
+            var clientSettings = serverSettings;
+            clientSettings.ThreadedIo = true;
+
+            using (var server = new LiteNetLibServerHost(serverSettings))
+            using (var client = new LiteNetLibClientHost(clientSettings))
+            {
+                Assert.That(server.Driver.ThreadedIo, Is.False);
+                Assert.That(client.Driver.ThreadedIo, Is.True);
+
+                var serverEndpoint = WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    Assert.That(client.Endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 32)), Is.True);
+                    var received = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(received, PacketKind.Ping, PacketFlags.ReliableOrdered, 32);
+                    received.Dispose();
+                    WaitForDeliveryAtLeast(server, client, 1);
+                }
+            }
+        }
     }
 }
