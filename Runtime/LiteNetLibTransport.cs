@@ -607,9 +607,25 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 return false;
             try
             {
+                // TrySend only ever receives packets this process just built via
+                // NetworkPacket.TryEncode or SnapshotChunkEncoder - every
+                // INetworkTransport.TrySend call site in unigame.staticecs.network
+                // (NetworkServer.Send, NetworkServer.SendSnapshotChunk,
+                // NetworkClient.Send, NetworkClient's command-batch send; server
+                // and client, reliable and unreliable, acks/resync/transactions
+                // included) passes a lease straight from one of those encoders,
+                // which always write a PayloadHash matching the bytes they just
+                // produced. Re-hashing the whole payload here, as
+                // NetworkPacket.TryDecode does for bytes received off the wire,
+                // would only repeat work already done a moment ago. Read and
+                // CRC-validate the fixed header alone; full payload-hash
+                // re-verification stays on the receive path (NetworkPacket.TryDecode
+                // in NetworkServer.DecodePacket / NetworkClient.Process), which
+                // handles untrusted bytes from the network.
                 if (_disposed || endpoint.IsDisposed || !endpoint.IsConnected ||
                     packet.Length < PacketHeader.Size ||
-                    !NetworkPacket.TryDecode(packet, out var header, out _))
+                    !PacketHeader.TryRead(packet.Span, out var header) ||
+                    packet.Length != PacketHeader.Size + header.PayloadLength)
                 {
                     RejectSend();
                     return false;

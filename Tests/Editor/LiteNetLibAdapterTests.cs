@@ -618,6 +618,98 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             }
         }
 
+        // NCORE-17a: TrySend now reads the fixed header with PacketHeader.TryRead
+        // instead of NetworkPacket.TryDecode, skipping the full-payload xxHash64
+        // re-verification because every caller hands it a packet this process just
+        // encoded itself (see the comment on TrySend). The header's own CRC32
+        // check is still mandatory, so a locally corrupted header must still be
+        // rejected without ever reaching the native peer.
+        [Test]
+        public void TrySendRejectsPacketWithCorruptedHeaderCrcWithoutSending()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                WaitForAccept(server, client);
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var valid = CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.UnreliableSequenced, 16);
+                    var bytes = valid.Span.ToArray();
+                    valid.Dispose();
+                    // Flip a byte inside SessionEpoch (offset 12), which the
+                    // header's CRC32 (offset 80) covers but PacketHeader.TryRead
+                    // never reaches the payload to verify.
+                    bytes[12] ^= 0xFF;
+                    var corrupted = pool.Copy(bytes);
+
+                    var before = client.CaptureDiagnostics();
+                    Assert.That(client.Endpoint.TrySend(corrupted), Is.False);
+                    var after = client.CaptureDiagnostics();
+                    Assert.That(after.SendFailures, Is.EqualTo(before.SendFailures + 1));
+                    Assert.That(after.NativeSentPackets,
+                        Is.EqualTo(before.NativeSentPackets),
+                        "a header that fails CRC validation must never reach the native peer");
+                    Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                }
+            }
+        }
+
+        // NCORE-17a: the receive path (untrusted bytes from the network) must keep
+        // full NetworkPacket.TryDecode verification, including the payload xxHash64
+        // check, even though the send path no longer re-hashes its own output.
+        [Test]
+        public void ReceiveRejectsPacketWithCorruptedPayloadHashFromUntrustedPeer()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var native = new NativePeerHarness(port,
+                       LiteNetLibLimits.MaximumFragmentsCount))
+            {
+                var endpoint = WaitForNativeAccept(server, native);
+                byte[] bytes;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    var valid = CreatePacket(pool, PacketKind.Ping,
+                        PacketFlags.ReliableOrdered, 16);
+                    bytes = valid.Span.ToArray();
+                    valid.Dispose();
+                }
+                // Corrupt one payload byte (after the fixed PacketHeader.Size
+                // prefix) without touching the header, so the header's own CRC32
+                // still validates but the payload no longer matches PayloadHash.
+                bytes[PacketHeader.Size] ^= 0xFF;
+
+                var before = server.CaptureDiagnostics();
+                native.Send(bytes, Native.DeliveryMethod.ReliableOrdered);
+
+                for (var i = 0; i < 500; i++)
+                {
+                    native.Pump();
+                    server.Update();
+                    server.Flush();
+                    Thread.Sleep(1);
+                }
+
+                var after = server.CaptureDiagnostics();
+                Assert.That(after.MalformedPackets,
+                    Is.GreaterThan(before.MalformedPackets));
+                Assert.That(endpoint.TryReceive(out var packet), Is.False,
+                    "a corrupted payload hash must never reach the application");
+                Assert.That(native.IsConnected, Is.True);
+                Assert.That(after.OutstandingLeases, Is.Zero);
+            }
+        }
+
         [Test]
         public void UnreliableReceiveOverflowDropsPacketWithoutDisconnectingPeer()
         {
