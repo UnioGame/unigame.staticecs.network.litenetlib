@@ -66,12 +66,25 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         /// reads, resend/ping timers, and queued sends run off the calling thread; when false (default),
         /// runs LiteNetLib in manual mode (<c>NetManager.StartInManualMode</c>) and pumps sockets synchronously
         /// on the caller, matching all behaviour before this option existed. In both modes,
-        /// <c>UnsyncedEvents</c>/<c>UnsyncedReceiveEvent</c>/<c>UnsyncedDeliveryEvent</c> stay false, so every
-        /// <c>INetEventListener</c> callback (accept, receive, delivery, disconnect) still runs only from the
-        /// calling thread's <c>Update()</c>/<c>PollEvents()</c> call; only native socket I/O and LiteNetLib's own
-        /// resend/ping scheduling move to its background threads.
+        /// <c>UnsyncedEvents</c>/<c>UnsyncedReceiveEvent</c> stay false, so accept, receive, and disconnect
+        /// callbacks still run only from the calling thread's <c>Update()</c>/<c>PollEvents()</c> call. The
+        /// diagnostic-only native delivery-event mode additionally enables <c>UnsyncedDeliveryEvent</c> so its
+        /// producer callback can capture a timestamp on LiteNetLib's logic thread.
         /// </summary>
         public bool ThreadedIo;
+
+        /// <summary>
+        /// Enables LiteNetLib's experimental direct socket I/O path. This requires
+        /// <see cref="ThreadedIo"/> and remains false by default; LiteNetLib itself
+        /// disables it when native sockets are unsupported on the current platform.
+        /// </summary>
+        public bool UseNativeSockets;
+
+        /// <summary>
+        /// Enables the diagnostic-only native delivery-event observation path. This requires a threaded
+        /// server and delivery-phase diagnostics; it is false by default and changes callback ordering.
+        /// </summary>
+        public bool NativeDeliveryEvents;
 
         /// <summary>Gets conservative defaults for one separated endpoint.</summary>
         public static LiteNetLibSettings Default => new LiteNetLibSettings
@@ -98,6 +111,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public LiteNetLibSettings Normalize(bool listener)
         {
             var value = this;
+            if (value.UseNativeSockets && !value.ThreadedIo)
+                throw new ArgumentException(
+                    "Native socket I/O requires threaded LiteNetLib I/O.",
+                    nameof(UseNativeSockets));
             if (string.IsNullOrWhiteSpace(value.Address))
                 value.Address = listener ? "0.0.0.0" : "127.0.0.1";
             if (value.Port == 0)
@@ -213,6 +230,16 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public long NativePacketLoss;
         /// <summary>Number of reliable delivery callbacks observed.</summary>
         public long DeliveryCallbacks;
+        /// <summary>Native snapshot send to delivery callback duration distribution.</summary>
+        public NetworkTimingHistogram SnapshotDelivery;
+        /// <summary>Native non-snapshot reliable send to delivery callback duration distribution.</summary>
+        public NetworkTimingHistogram OtherDelivery;
+        /// <summary>Managed reliable FIFO enqueue to native submission duration distribution.</summary>
+        public NetworkTimingHistogram ManagedPromotion;
+        /// <summary>Interval between owner PollEvents starts, excluding the first poll.</summary>
+        public NetworkTimingHistogram OwnerPollInterval;
+        /// <summary>Owner PollEvents duration, including delivery callback processing.</summary>
+        public NetworkTimingHistogram OwnerPollDuration;
         /// <summary>Number of reliable receive overflows that requested peer disconnect.</summary>
         public long ReliableReceiveOverflowDisconnects;
         /// <summary>Number of sequenced packets dropped because a receive queue was full.</summary>
@@ -245,6 +272,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         public void Update() => _driver.Update();
         /// <summary>Advances native reliable sends after protocol sends.</summary>
         public void Flush() => _driver.Flush();
+        /// <summary>Gets whether native delivery-event diagnostics are active for this listener.</summary>
+        public bool NativeDeliveryEvents => _driver.NativeDeliveryEvents;
+        /// <summary>Gets whether LiteNetLib is running with native socket I/O enabled.</summary>
+        public bool NativeSocketsEnabled => _driver.NativeSocketsEnabled;
         /// <summary>Captures adapter and pool counters.</summary>
         public LiteNetLibDiagnostics CaptureDiagnostics() => _driver.CaptureDiagnostics();
         internal LiteNetLibDriver Driver => _driver;
@@ -272,6 +303,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _driver.TryDequeueDisconnected(out connection);
         /// <summary>Advances native reliable sends after protocol sends.</summary>
         public void Flush() => _driver.Flush();
+        /// <summary>Reports whether native delivery events are observed by the diagnostic experiment.</summary>
+        public bool NativeDeliveryEvents => _driver.NativeDeliveryEvents;
+        /// <summary>Gets whether LiteNetLib is running with native socket I/O enabled.</summary>
+        public bool NativeSocketsEnabled => _driver.NativeSocketsEnabled;
         /// <summary>Captures adapter and pool counters.</summary>
         public LiteNetLibDiagnostics CaptureDiagnostics() => _driver.CaptureDiagnostics();
         internal LiteNetLibDriver Driver => _driver;
@@ -284,6 +319,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private readonly LiteNetLibSettings _settings;
         private readonly bool _listener;
         private readonly bool _threadedIo;
+        private readonly bool _nativeDeliveryEvents;
         private readonly NetworkBufferPool _pool;
         private readonly NetManager _manager;
         private readonly Dictionary<NetPeer, LiteNetLibEndpoint> _endpoints =
@@ -332,12 +368,52 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private readonly int _nativeFragmentAdmissionBudget;
         private int _drainCursor;
         private readonly Queue<DeliveryTicket> _deliveryTickets = new Queue<DeliveryTicket>();
+        private readonly DeliveryObservationSlot[] _deliveryObservationSlots;
+        private long _nextDeliveryObservationId;
         private int _deliveryTicketsCreated;
         private int _deliveryTicketsRented;
         private int _deliveryTicketsReused;
         private int _deliveryTicketsDiscarded;
+        private TimingHistogramAccumulator _snapshotDelivery;
+        private TimingHistogramAccumulator _otherDelivery;
+        private TimingHistogramAccumulator _managedPromotion;
+        private TimingHistogramAccumulator _ownerPollInterval;
+        private TimingHistogramAccumulator _ownerPollDuration;
+        private readonly Func<long> _monotonicTimestamp;
+        private long _lastOwnerPollTimestamp;
+        private bool _hasOwnerPollTimestamp;
 
         internal const int DeliveryTicketPoolCapacity = 4096;
+
+        private enum DeliveryObservationSlotState
+        {
+            Reserved = 0,
+            Capturing = 1,
+            Captured = 2,
+            Draining = 3,
+            Retired = 4,
+            Consumed = 5,
+        }
+
+        internal sealed class DeliveryObservationSlot
+        {
+            internal DeliveryObservationReservation Reservation;
+        }
+
+        internal sealed class DeliveryObservationReservation
+        {
+            internal readonly long Id;
+            internal readonly DeliveryTicket Ticket;
+            internal int State;
+            internal long NativeEventTimestamp;
+
+            internal DeliveryObservationReservation(long id, DeliveryTicket ticket)
+            {
+                Id = id;
+                Ticket = ticket;
+                State = (int)DeliveryObservationSlotState.Reserved;
+            }
+        }
 
         internal int DeliveryTicketsCreated => _deliveryTicketsCreated;
         internal int DeliveryTicketsRented => _deliveryTicketsRented;
@@ -452,13 +528,23 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal bool ContainsRetainedDeliveryTicket(DeliveryTicket ticket) =>
             _deliveryTickets.Contains(ticket);
 
-        internal LiteNetLibDriver(LiteNetLibSettings settings, bool listener)
+        internal LiteNetLibDriver(LiteNetLibSettings settings, bool listener,
+            Func<long> monotonicTimestamp = null)
         {
+            _monotonicTimestamp = monotonicTimestamp ?? Stopwatch.GetTimestamp;
             _settings = settings;
             _listener = listener;
             _threadedIo = settings.ThreadedIo;
+            _nativeDeliveryEvents = settings.NativeDeliveryEvents;
+            if (_nativeDeliveryEvents && (!listener || !_threadedIo))
+                throw new ArgumentException(
+                    "Native delivery-event diagnostics require a threaded LiteNetLib server.",
+                    nameof(settings));
             _nativeFragmentAdmissionBudget =
                 ComputeNativeFragmentAdmissionBudget(settings.NativePacketPoolSize);
+            _deliveryObservationSlots = _nativeDeliveryEvents
+                ? CreateDeliveryObservationSlots(_nativeFragmentAdmissionBudget)
+                : Array.Empty<DeliveryObservationSlot>();
             var drainCapacity = settings.MaximumConnections <= 0
                 ? 1
                 : (int)Math.Min((long)settings.MaximumConnections + 1L, 4096L);
@@ -477,9 +563,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 MaxFragmentsCount = LiteNetLibLimits.MaximumFragmentsCount,
                 MaxPacketPerManualReceive = Math.Max(1, settings.ReceiveQueueCapacity),
                 PacketPoolSize = settings.NativePacketPoolSize,
+                UseNativeSockets = settings.UseNativeSockets,
                 UnsyncedEvents = false,
                 UnsyncedReceiveEvent = false,
-                UnsyncedDeliveryEvent = false,
+                UnsyncedDeliveryEvent = _nativeDeliveryEvents,
             };
             if (_threadedIo)
             {
@@ -534,12 +621,152 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal bool Connected => _clientEndpoint != null && _clientEndpoint.IsConnected;
         internal LiteNetLibSettings Settings => _settings;
         internal bool ThreadedIo => _threadedIo;
+        internal bool NativeDeliveryEvents => _nativeDeliveryEvents;
+        internal bool NativeSocketsEnabled => _manager.IsRunning && _manager.UseNativeSockets;
+        internal long MonotonicTimestamp() => _monotonicTimestamp();
+
+        private static DeliveryObservationSlot[] CreateDeliveryObservationSlots(int capacity)
+        {
+            var slots = new DeliveryObservationSlot[Math.Max(1, capacity)];
+            for (var index = 0; index < slots.Length; index++)
+                slots[index] = new DeliveryObservationSlot();
+            return slots;
+        }
+
+        private bool HasFreeDeliveryObservationSlot()
+        {
+            if (!_nativeDeliveryEvents)
+                return true;
+            for (var index = 0; index < _deliveryObservationSlots.Length; index++)
+                if (System.Threading.Volatile.Read(
+                        ref _deliveryObservationSlots[index].Reservation) == null)
+                    return true;
+            return false;
+        }
+
+        private bool ReserveDeliveryObservation(DeliveryTicket ticket)
+        {
+            if (!_nativeDeliveryEvents)
+                return true;
+            for (var index = 0; index < _deliveryObservationSlots.Length; index++)
+            {
+                var slot = _deliveryObservationSlots[index];
+                var reservation = new DeliveryObservationReservation(
+                    System.Threading.Interlocked.Increment(ref _nextDeliveryObservationId),
+                    ticket);
+                if (System.Threading.Interlocked.CompareExchange(ref slot.Reservation,
+                        reservation, null) != null)
+                    continue;
+                ticket.BindDeliveryObservation(index, slot, reservation);
+                return true;
+            }
+            return false;
+        }
+
+        private void ReleaseDeliveryObservation(DeliveryTicket ticket)
+        {
+            if (!_nativeDeliveryEvents || ticket.ObservationSlot < 0 ||
+                ticket._deliveryObservationToken == null)
+                return;
+            var token = ticket._deliveryObservationToken;
+            var reservation = token.Reservation;
+            if (System.Threading.Volatile.Read(ref token.Slot.Reservation) != reservation)
+                return;
+            if (System.Threading.Interlocked.CompareExchange(ref reservation.State,
+                    (int)DeliveryObservationSlotState.Consumed,
+                    (int)DeliveryObservationSlotState.Retired) !=
+                (int)DeliveryObservationSlotState.Retired)
+                return;
+            System.Threading.Interlocked.CompareExchange(ref token.Slot.Reservation,
+                null, reservation);
+            ticket.ClearDeliveryObservation(reservation);
+        }
+
+        internal void RetireDeliveryObservation(DeliveryTicket ticket)
+        {
+            if (!_nativeDeliveryEvents || ticket.ObservationSlot < 0 ||
+                ticket._deliveryObservationToken == null)
+                return;
+            var token = ticket._deliveryObservationToken;
+            var reservation = token.Reservation;
+            if (System.Threading.Volatile.Read(ref token.Slot.Reservation) != reservation)
+                return;
+            if (System.Threading.Interlocked.CompareExchange(ref reservation.State,
+                    (int)DeliveryObservationSlotState.Retired,
+                    (int)DeliveryObservationSlotState.Reserved) ==
+                (int)DeliveryObservationSlotState.Reserved)
+                ReleaseDeliveryObservation(ticket);
+        }
+
+        private bool CaptureDeliveryObservation(DeliveryObservationToken token)
+        {
+            if (!_nativeDeliveryEvents || _disposed || token == null ||
+                System.Threading.Volatile.Read(ref token.Slot.Reservation) !=
+                    token.Reservation)
+                return false;
+            if (System.Threading.Interlocked.CompareExchange(ref token.Reservation.State,
+                    (int)DeliveryObservationSlotState.Capturing,
+                    (int)DeliveryObservationSlotState.Reserved) !=
+                (int)DeliveryObservationSlotState.Reserved)
+                return false;
+            token.Reservation.NativeEventTimestamp = MonotonicTimestamp();
+            System.Threading.Volatile.Write(ref token.Reservation.State,
+                (int)DeliveryObservationSlotState.Captured);
+            return true;
+        }
+
+        private void DrainDeliveryObservations()
+        {
+            if (!_nativeDeliveryEvents)
+                return;
+            for (var index = 0; index < _deliveryObservationSlots.Length; index++)
+            {
+                var slot = _deliveryObservationSlots[index];
+                var reservation = System.Threading.Volatile.Read(ref slot.Reservation);
+                if (reservation == null ||
+                    System.Threading.Interlocked.CompareExchange(ref reservation.State,
+                        (int)DeliveryObservationSlotState.Draining,
+                        (int)DeliveryObservationSlotState.Captured) !=
+                    (int)DeliveryObservationSlotState.Captured)
+                    continue;
+                var ticket = reservation.Ticket;
+                try
+                {
+                    ticket?.CompleteByNativeEvent(reservation.NativeEventTimestamp,
+                        MonotonicTimestamp());
+                }
+                finally
+                {
+                    System.Threading.Interlocked.CompareExchange(ref slot.Reservation,
+                        null, reservation);
+                    System.Threading.Volatile.Write(ref reservation.State,
+                        (int)DeliveryObservationSlotState.Consumed);
+                    ticket?.ClearDeliveryObservation(reservation);
+                }
+            }
+        }
 
         internal void Update()
         {
             ThrowIfDisposed();
             using var nativeScope = NetworkDiagnosticMarkers.Measure(NetworkDiagnosticPhase.NativeUpdate);
-            _manager.PollEvents();
+            var started = MonotonicTimestamp();
+            if (_hasOwnerPollTimestamp && started >= _lastOwnerPollTimestamp)
+                _ownerPollInterval.Add(started - _lastOwnerPollTimestamp);
+            _lastOwnerPollTimestamp = started;
+            _hasOwnerPollTimestamp = true;
+            try
+            {
+                DrainDeliveryObservations();
+                _manager.PollEvents();
+            }
+            finally
+            {
+                DrainDeliveryObservations();
+                var completed = MonotonicTimestamp();
+                if (completed >= started)
+                    _ownerPollDuration.Add(completed - started);
+            }
             ObserveNativePacketPool();
         }
 
@@ -707,15 +934,27 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             try
             {
                 ticket = RentDeliveryTicket(endpoint, fragments, packet.Length,
-                    header.Kind == PacketKind.SnapshotChunk);
+                    header.Kind == PacketKind.SnapshotChunk, header.ServerTick,
+                    header.PacketSequence);
                 endpoint.TrackTicket(ticket);
+                if (!ReserveDeliveryObservation(ticket))
+                {
+                    throw new InvalidOperationException(
+                        "Native delivery-event diagnostic observation capacity is unavailable.");
+                }
                 RegisterNative(ticket);
                 if (ThrowOnNextReliableSubmit)
                 {
                     ThrowOnNextReliableSubmit = false;
                     throw new InvalidOperationException("Injected reliable submit failure.");
                 }
-                endpoint.Peer.SendWithDeliveryEvent(packet.Span, DeliveryMethod.ReliableOrdered, ticket);
+                ticket.MarkSubmitted();
+                endpoint.Peer.SendWithDeliveryEvent(packet.Span,
+                    DeliveryMethod.ReliableOrdered, ticket.DeliveryEventUserData);
+                if (ticket.Snapshot && endpoint.HasDeliveryPhaseDiagnostics)
+                    endpoint.RecordNativeTicketSubmission(ticket.SnapshotServerTick,
+                        ticket.SnapshotPacketSequence,
+                        ticket.SubmittedStopwatchTicks);
                 ObserveNativePacketPool();
                 _sent++;
                 _reliableSentPackets++;
@@ -735,7 +974,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         }
 
         private DeliveryTicket RentDeliveryTicket(LiteNetLibEndpoint endpoint,
-            int fragments, int bytes, bool snapshot)
+            int fragments, int bytes, bool snapshot, uint snapshotServerTick,
+            uint snapshotPacketSequence)
         {
             DeliveryTicket ticket;
             if (_deliveryTickets.Count > 0)
@@ -749,7 +989,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 _deliveryTicketsCreated++;
             }
             _deliveryTicketsRented++;
-            ticket.Reset(endpoint, fragments, bytes, snapshot);
+            ticket.Reset(endpoint, fragments, bytes, snapshot, snapshotServerTick,
+                snapshotPacketSequence);
             return ticket;
         }
 
@@ -856,6 +1097,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         }
 
         internal bool CanRegisterNative(LiteNetLibEndpoint endpoint, int fragments, int bytes) =>
+            HasFreeDeliveryObservationSlot() &&
             _nativeReliableFragments <= _nativeFragmentAdmissionBudget - fragments &&
             endpoint.NativeReliableFragments <= _settings.NativeReliableFragmentsCapacity - fragments &&
             endpoint.NativeReliableBytes <= _settings.NativeReliableBytesCapacity - bytes;
@@ -1038,11 +1280,41 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         internal void OnDelivery(NetPeer peer, object userData)
         {
+            if (userData is DeliveryObservationToken token)
+            {
+                CaptureDeliveryObservation(token);
+                return;
+            }
             if (userData is DeliveryTicket ticket)
             {
+                if (_nativeDeliveryEvents)
+                {
+                    ticket.CaptureDiagnosticDeliveryEvent();
+                    return;
+                }
                 ticket.CompleteByCallback();
                 _deliveryCallbacks++;
             }
+        }
+
+        internal void RecordManagedPromotion(long queuedStopwatchTicks)
+        {
+            if (queuedStopwatchTicks == 0)
+                return;
+            _managedPromotion.Add(MonotonicTimestamp() -
+                queuedStopwatchTicks);
+        }
+
+        private void RecordDeliveryLatency(DeliveryTicket ticket, long observedTimestamp)
+        {
+            if (ticket.SubmittedStopwatchTicks == 0)
+                return;
+            var elapsed = observedTimestamp -
+                ticket.SubmittedStopwatchTicks;
+            if (ticket.Snapshot)
+                _snapshotDelivery.Add(elapsed);
+            else
+                _otherDelivery.Add(elapsed);
         }
 
         internal void DisposeEndpoint(LiteNetLibEndpoint endpoint)
@@ -1165,6 +1437,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 NativeReceivedBytes = _manager.Statistics.BytesReceived,
                 NativePacketLoss = _manager.Statistics.PacketLoss,
                 DeliveryCallbacks = _deliveryCallbacks,
+                SnapshotDelivery = _snapshotDelivery.Capture(),
+                OtherDelivery = _otherDelivery.Capture(),
+                ManagedPromotion = _managedPromotion.Capture(),
+                OwnerPollInterval = _ownerPollInterval.Capture(),
+                OwnerPollDuration = _ownerPollDuration.Capture(),
                 ReliableReceiveOverflowDisconnects = _reliableReceiveOverflowDisconnects,
                 UnreliableReceiveDrops = _unreliableReceiveDrops,
                 NativePacketPoolCount = _manager.PoolCount,
@@ -1178,15 +1455,20 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             if (_disposed)
                 return;
             _disposed = true;
+            // Stop the native producer before retiring endpoints or clearing the bounded handoff.
+            // UnsyncedDeliveryEvent may run on LiteNetLib's logic thread in this diagnostic mode.
+            _manager.Stop(false);
+            DrainDeliveryObservations();
             foreach (var endpoint in _endpoints.Values)
                 endpoint.CloseFromDriver();
+            DrainDeliveryObservations();
             _endpoints.Clear();
             _drainOrder.Clear();
             _drainCursor = 0;
             _accepted.Clear();
             _disconnected.Clear();
             _deliveryTickets.Clear();
-            _manager.Stop(false);
+            Array.Clear(_deliveryObservationSlots, 0, _deliveryObservationSlots.Length);
             _pool.Dispose();
         }
 
@@ -1220,6 +1502,73 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             public void OnMessageDelivered(NetPeer peer, object userData) => _owner.OnDelivery(peer, userData);
         }
 
+        private struct TimingHistogramAccumulator
+        {
+            private long _samples;
+            private long _sumMicroseconds;
+            private long _maxMicroseconds;
+            private long _upTo25Milliseconds;
+            private long _upTo50Milliseconds;
+            private long _upTo100Milliseconds;
+            private long _upTo200Milliseconds;
+            private long _upTo400Milliseconds;
+            private long _upTo800Milliseconds;
+            private long _overflow;
+
+            internal void Add(long elapsedStopwatchTicks)
+            {
+                if (elapsedStopwatchTicks < 0)
+                    return;
+                var microseconds = ToMicroseconds(elapsedStopwatchTicks);
+                _samples = SaturatingIncrement(_samples);
+                if (_sumMicroseconds > long.MaxValue - microseconds)
+                    _sumMicroseconds = long.MaxValue;
+                else
+                    _sumMicroseconds += microseconds;
+                if (microseconds > _maxMicroseconds)
+                    _maxMicroseconds = microseconds;
+                if (microseconds <= 25_000)
+                    _upTo25Milliseconds = SaturatingIncrement(_upTo25Milliseconds);
+                else if (microseconds <= 50_000)
+                    _upTo50Milliseconds = SaturatingIncrement(_upTo50Milliseconds);
+                else if (microseconds <= 100_000)
+                    _upTo100Milliseconds = SaturatingIncrement(_upTo100Milliseconds);
+                else if (microseconds <= 200_000)
+                    _upTo200Milliseconds = SaturatingIncrement(_upTo200Milliseconds);
+                else if (microseconds <= 400_000)
+                    _upTo400Milliseconds = SaturatingIncrement(_upTo400Milliseconds);
+                else if (microseconds <= 800_000)
+                    _upTo800Milliseconds = SaturatingIncrement(_upTo800Milliseconds);
+                else
+                    _overflow = SaturatingIncrement(_overflow);
+            }
+
+            internal NetworkTimingHistogram Capture() => new NetworkTimingHistogram(
+                _samples, _sumMicroseconds, _maxMicroseconds,
+                _upTo25Milliseconds, _upTo50Milliseconds,
+                _upTo100Milliseconds, _upTo200Milliseconds,
+                _upTo400Milliseconds, _upTo800Milliseconds, _overflow);
+
+            private static long SaturatingIncrement(long value) =>
+                value == long.MaxValue ? value : value + 1;
+
+            private static long ToMicroseconds(long stopwatchTicks)
+            {
+                if (stopwatchTicks <= 0)
+                    return 0;
+                var frequency = Stopwatch.Frequency;
+                var seconds = stopwatchTicks / frequency;
+                var remainder = stopwatchTicks % frequency;
+                if (seconds > long.MaxValue / 1_000_000L)
+                    return long.MaxValue;
+                var microseconds = seconds * 1_000_000L;
+                var fraction = remainder * 1_000_000L / frequency;
+                return microseconds > long.MaxValue - fraction
+                    ? long.MaxValue
+                    : microseconds + fraction;
+            }
+        }
+
         internal enum DeliveryTicketState
         {
             Active = 0,
@@ -1232,6 +1581,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             private readonly LiteNetLibDriver _driver;
             private LiteNetLibEndpoint _endpoint;
             private int _state;
+            private int _generation;
+            internal DeliveryObservationToken _deliveryObservationToken;
+            internal int ObservationSlot { get; private set; } = -1;
 
             internal DeliveryTicket(LiteNetLibDriver driver)
             {
@@ -1240,27 +1592,95 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             }
 
             internal LiteNetLibEndpoint Endpoint => _endpoint;
+            internal int Generation => _generation;
             public int Fragments { get; private set; }
             public int Bytes { get; private set; }
             public bool Snapshot { get; private set; }
+            internal long SubmittedStopwatchTicks { get; private set; }
+            internal uint SnapshotServerTick { get; private set; }
+            internal uint SnapshotPacketSequence { get; private set; }
             internal DeliveryTicketState State => (DeliveryTicketState)_state;
+            internal object DeliveryEventUserData =>
+                _driver.NativeDeliveryEvents ? (object)_deliveryObservationToken : this;
 
             internal void Reset(LiteNetLibEndpoint endpoint,
-                int fragments, int bytes, bool snapshot)
+                int fragments, int bytes, bool snapshot, uint snapshotServerTick,
+                uint snapshotPacketSequence)
             {
                 _endpoint = endpoint;
                 Fragments = fragments;
                 Bytes = bytes;
                 Snapshot = snapshot;
+                SnapshotServerTick = snapshot ? snapshotServerTick : 0;
+                SnapshotPacketSequence = snapshot ? snapshotPacketSequence : 0;
+                SubmittedStopwatchTicks = 0;
+                unchecked { _generation++; }
+                ObservationSlot = -1;
+                _deliveryObservationToken = null;
                 _state = (int)DeliveryTicketState.Active;
             }
 
+            internal void BindDeliveryObservation(int slot,
+                DeliveryObservationSlot observationSlot,
+                DeliveryObservationReservation reservation)
+            {
+                ObservationSlot = slot;
+                _deliveryObservationToken = new DeliveryObservationToken(slot,
+                    observationSlot, reservation);
+            }
+
+            internal void ClearDeliveryObservation(
+                DeliveryObservationReservation reservation = null)
+            {
+                if (reservation != null &&
+                    (_deliveryObservationToken == null ||
+                     !_deliveryObservationToken.Matches(reservation)))
+                    return;
+                ObservationSlot = -1;
+                _deliveryObservationToken = null;
+            }
+
+            internal bool CaptureDiagnosticDeliveryEvent()
+            {
+                return _driver.CaptureDeliveryObservation(_deliveryObservationToken);
+            }
+
+            internal void MarkSubmitted() =>
+                SubmittedStopwatchTicks = _driver.MonotonicTimestamp();
+
             internal bool CompleteByCallback()
+            {
+                return CompleteByOwnerTimestamp(_driver.MonotonicTimestamp(), 0);
+            }
+
+            internal bool CompleteByNativeEvent(long nativeEventTimestamp,
+                long ownerDispatchTimestamp)
+            {
+                var completed = CompleteByOwnerTimestamp(ownerDispatchTimestamp,
+                    nativeEventTimestamp);
+                if (completed)
+                    _driver._deliveryCallbacks++;
+                return completed;
+            }
+
+            private bool CompleteByOwnerTimestamp(long observedTimestamp,
+                long nativeEventTimestamp)
             {
                 if (System.Threading.Interlocked.CompareExchange(ref _state,
                         (int)DeliveryTicketState.CompletedByCallback,
                         (int)DeliveryTicketState.Active) != (int)DeliveryTicketState.Active)
                     return false;
+                _driver.RecordDeliveryLatency(this, observedTimestamp);
+                if (Snapshot)
+                {
+                    if (nativeEventTimestamp > 0 && _endpoint.HasDeliveryPhaseDiagnostics)
+                        _endpoint.RecordNativeDeliveryEvent(SnapshotServerTick,
+                            SnapshotPacketSequence, nativeEventTimestamp);
+                    if (_endpoint.HasDeliveryPhaseDiagnostics)
+                        _endpoint.RecordDeliveryCallback(SnapshotServerTick,
+                            SnapshotPacketSequence, observedTimestamp);
+                    _endpoint.RecordSnapshotDeliveryObservation(SnapshotServerTick, observedTimestamp);
+                }
                 _endpoint.CompleteTicket(this);
                 ClearOwnership();
                 _driver.ReturnDeliveryTicket(this);
@@ -1274,6 +1694,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                         (int)DeliveryTicketState.Active) != (int)DeliveryTicketState.Active)
                     return false;
                 _endpoint.CompleteTicket(this);
+                _driver.RetireDeliveryObservation(this);
                 ClearOwnership();
                 return true;
             }
@@ -1284,13 +1705,38 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 Fragments = 0;
                 Bytes = 0;
                 Snapshot = false;
+                SnapshotServerTick = 0;
+                SnapshotPacketSequence = 0;
+                SubmittedStopwatchTicks = 0;
+                ClearDeliveryObservation();
             }
+        }
+
+        /// <summary>Immutable reservation identity handed to LiteNetLib's native callback.</summary>
+        internal sealed class DeliveryObservationToken
+        {
+            internal DeliveryObservationToken(int slotIndex,
+                DeliveryObservationSlot slot,
+                DeliveryObservationReservation reservation)
+            {
+                SlotIndex = slotIndex;
+                Slot = slot;
+                Reservation = reservation;
+            }
+
+            internal int SlotIndex { get; }
+            internal DeliveryObservationSlot Slot { get; }
+            internal DeliveryObservationReservation Reservation { get; }
+
+            internal bool Matches(DeliveryObservationReservation reservation) =>
+                ReferenceEquals(Reservation, reservation);
         }
     }
 
     internal sealed class LiteNetLibEndpoint : INetworkTransport,
         INetworkReliableSendPreflight,
-        INetworkReliableSendState
+        INetworkReliableSendState, INetworkReliableDeliveryObservation,
+        INetworkDeliveryPhaseTransport
     {
         private readonly LiteNetLibDriver _owner;
         private readonly Queue<NetworkBufferLease> _incoming;
@@ -1306,6 +1752,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         private long _nativeReliableBytes;
         private int _pendingSnapshotChunks;
         private uint _pendingSnapshotTick;
+        private NetworkDeliveryPhaseRecorder _deliveryPhaseDiagnostics;
+        private int _deliveryPhasePeerIndex = -1;
 
         internal LiteNetLibEndpoint(LiteNetLibDriver owner, NetPeer peer,
             ConnectionId connection, int receiveQueueCapacity)
@@ -1317,6 +1765,33 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         }
 
         public ConnectionId Connection { get; }
+        internal bool HasDeliveryPhaseDiagnostics =>
+            _deliveryPhaseDiagnostics != null;
+        public NetworkReliableDeliveryObservation LastSnapshotDeliveryObservation { get; private set; }
+        void INetworkDeliveryPhaseTransport.ConfigureDeliveryPhaseDiagnostics(
+            NetworkDeliveryPhaseRecorder recorder, int peerIndex)
+        {
+            _deliveryPhaseDiagnostics = recorder;
+            _deliveryPhasePeerIndex = peerIndex;
+        }
+
+        internal void RecordNativeTicketSubmission(uint serverTick,
+            uint packetSequence, long timestamp) =>
+            _deliveryPhaseDiagnostics?.RecordNativeTicketSubmission(
+                _deliveryPhasePeerIndex, serverTick, packetSequence, timestamp);
+
+        internal void RecordDeliveryCallback(uint serverTick,
+            uint packetSequence, long timestamp) =>
+            _deliveryPhaseDiagnostics?.RecordDeliveryCallback(
+                _deliveryPhasePeerIndex, serverTick, packetSequence, timestamp);
+
+        internal void RecordNativeDeliveryEvent(uint serverTick,
+            uint packetSequence, long timestamp) =>
+            _deliveryPhaseDiagnostics?.RecordNativeDeliveryEvent(
+                _deliveryPhasePeerIndex, serverTick, packetSequence, timestamp);
+
+        internal void RecordSnapshotDeliveryObservation(uint snapshotServerTick, long observedTimestamp) =>
+            LastSnapshotDeliveryObservation = new NetworkReliableDeliveryObservation(snapshotServerTick, observedTimestamp);
         internal NetPeer Peer { get; }
         internal bool IsConnected => _connected && !_disposed;
         internal bool IsDisposed => _disposed;
@@ -1417,7 +1892,14 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             }
             _owner.ReserveManagedReliable(fragments, packet.Length);
             TrackSnapshot(header);
-            _pendingReliable.Enqueue(new PendingReliable(packet, header, fragments));
+            var enqueuedTimestamp = _owner.MonotonicTimestamp();
+            _pendingReliable.Enqueue(new PendingReliable(packet, header, fragments,
+                enqueuedTimestamp));
+            if (header.Kind == PacketKind.SnapshotChunk &&
+                _deliveryPhaseDiagnostics != null)
+                _deliveryPhaseDiagnostics?.RecordManagedFifoEnqueue(
+                    _deliveryPhasePeerIndex, header.ServerTick,
+                    header.PacketSequence, enqueuedTimestamp);
             _pendingReliableBytes += packet.Length;
             _pendingReliableFragments += fragments;
             return true;
@@ -1434,6 +1916,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             _pendingReliableBytes -= next.Packet.Length;
             _pendingReliableFragments -= next.Fragments;
             _owner.ReleaseManagedReliable(next.Fragments, next.Packet.Length);
+            _owner.RecordManagedPromotion(next.EnqueuedStopwatchTicks);
             _owner.SubmitQueuedReliable(this, next.Packet, next.Header, next.Fragments);
             return true;
         }
@@ -1533,16 +2016,19 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
         private readonly struct PendingReliable
         {
-            public PendingReliable(NetworkBufferLease packet, PacketHeader header, int fragments)
+            public PendingReliable(NetworkBufferLease packet, PacketHeader header,
+                int fragments, long enqueuedStopwatchTicks)
             {
                 Packet = packet;
                 Header = header;
                 Fragments = fragments;
+                EnqueuedStopwatchTicks = enqueuedStopwatchTicks;
             }
 
             public NetworkBufferLease Packet { get; }
             public PacketHeader Header { get; }
             public int Fragments { get; }
+            public long EnqueuedStopwatchTicks { get; }
         }
     }
 

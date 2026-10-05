@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Native = global::LiteNetLib;
 using NUnit.Framework;
@@ -25,6 +27,178 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 Is.EqualTo(LiteNetLibLimits.MaximumSequencedBytes));
             Assert.That(LiteNetLibSettings.Default.Normalize(false).MaximumUnreliableBytes,
                 Is.EqualTo(LiteNetLibLimits.MaximumSequencedBytes));
+        }
+
+        [Test]
+        public void OwnerPollingUsesMonotonicIntervalsWithoutInventingFirstInterval()
+        {
+            var frequency = System.Diagnostics.Stopwatch.Frequency;
+            var times = new Queue<long>(new[] { frequency, frequency + frequency / 500,
+                frequency + frequency / 20, frequency + frequency * 53 / 1000 });
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            using (var driver = new LiteNetLibDriver(settings, true, () => times.Dequeue()))
+            {
+                driver.Update();
+                var first = driver.CaptureDiagnostics();
+                Assert.That(first.OwnerPollInterval.Samples, Is.Zero);
+                Assert.That(first.OwnerPollDuration.Samples, Is.EqualTo(1));
+                driver.Update();
+                var second = driver.CaptureDiagnostics();
+                Assert.That(second.OwnerPollInterval.Samples, Is.EqualTo(1));
+                Assert.That(second.OwnerPollInterval.SumMicroseconds, Is.EqualTo(50_000));
+                Assert.That(second.OwnerPollDuration.Samples, Is.EqualTo(2));
+                Assert.That(second.OwnerPollDuration.SumMicroseconds, Is.EqualTo(5_000));
+                Assert.That(times, Is.Empty);
+            }
+        }
+
+        [Test]
+        public void NativeDeliveryObservationRejectsStaleTokenAfterSameGenerationReuse()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.ThreadedIo = true;
+            settings.NativeDeliveryEvents = true;
+            using (var driver = new LiteNetLibDriver(settings, true))
+            {
+                var endpoint = new LiteNetLibEndpoint(driver, null, new ConnectionId(1),
+                    settings.ReceiveQueueCapacity);
+                var first = NewObservationTicket(driver, endpoint);
+                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", first),
+                    Is.True);
+                var staleToken = first.DeliveryEventUserData;
+                Assert.That(first.Retire(), Is.True);
+                var firstGeneration = first.Generation;
+                first.Reset(endpoint, 1, PacketHeader.Size + 32, false, 0, 0);
+                Assert.That(first.Generation, Is.EqualTo(firstGeneration + 1));
+                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", first),
+                    Is.True);
+                var currentToken = first.DeliveryEventUserData;
+
+                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation", staleToken),
+                    Is.False);
+                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation", currentToken),
+                    Is.True);
+                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation", currentToken),
+                    Is.False);
+
+                driver.Update();
+                Assert.That(first.State,
+                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.CompletedByCallback));
+                Assert.That(InvokePrivate<bool>(driver, "HasFreeDeliveryObservationSlot"),
+                    Is.True);
+            }
+        }
+
+        [Test]
+        public void NativeDeliveryObservationKeepsCapturedRetiredSlotUntilOwnerDrain()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.ThreadedIo = true;
+            settings.NativeDeliveryEvents = true;
+            using (var driver = new LiteNetLibDriver(settings, true))
+            {
+                var endpoint = new LiteNetLibEndpoint(driver, null, new ConnectionId(1),
+                    settings.ReceiveQueueCapacity);
+                var captured = NewObservationTicket(driver, endpoint);
+                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", captured),
+                    Is.True);
+                var capturedSlot = captured.ObservationSlot;
+                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation",
+                        captured.DeliveryEventUserData), Is.True);
+                Assert.That(captured.Retire(), Is.True);
+
+                var replacement = NewObservationTicket(driver, endpoint);
+                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", replacement),
+                    Is.True);
+                Assert.That(replacement.ObservationSlot,
+                    Is.Not.EqualTo(capturedSlot));
+
+                driver.Update();
+                Assert.That(captured.State,
+                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
+                Assert.That(replacement.State,
+                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Active));
+                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation",
+                        replacement.DeliveryEventUserData), Is.True);
+                driver.Update();
+                driver.RetireDeliveryObservation(replacement);
+                Assert.That(replacement.State,
+                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.CompletedByCallback));
+                Assert.That(InvokePrivate<bool>(driver, "HasFreeDeliveryObservationSlot"),
+                    Is.True);
+            }
+        }
+
+        [Test]
+        public void NativeDeliveryObservationDrainsCapturedReservationBeforeDisposeClearsSlots()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            settings.ThreadedIo = true;
+            settings.NativeDeliveryEvents = true;
+            using (var driver = new LiteNetLibDriver(settings, true))
+            {
+                var endpoint = new LiteNetLibEndpoint(driver, null, new ConnectionId(1),
+                    settings.ReceiveQueueCapacity);
+                var ticket = NewObservationTicket(driver, endpoint);
+                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", ticket),
+                    Is.True);
+                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation",
+                    ticket.DeliveryEventUserData), Is.True);
+
+                driver.Dispose();
+
+                Assert.That(ticket.State,
+                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.CompletedByCallback));
+            }
+        }
+
+        [Test]
+        public void SnapshotDeliveryObservationIgnoresControlFailureRetirementAndDuplicateCallback()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+            {
+                WaitForAccept(server, client);
+                var endpoint = (LiteNetLibEndpoint)client.Endpoint;
+                Assert.That(endpoint.LastSnapshotDeliveryObservation.ObservedStopwatchTicks, Is.Zero);
+                Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                    PacketFlags.ReliableOrdered, 32, 20)), Is.True);
+                Assert.That(endpoint.TryGetActiveTicket(out var snapshot), Is.True);
+                client.Driver.OnDelivery(null, snapshot);
+                var observation = endpoint.LastSnapshotDeliveryObservation;
+                Assert.That(observation.SnapshotServerTick, Is.EqualTo(20));
+                Assert.That(observation.ObservedStopwatchTicks, Is.GreaterThan(0));
+                client.Driver.OnDelivery(null, snapshot);
+                Assert.That(endpoint.LastSnapshotDeliveryObservation.ObservedStopwatchTicks,
+                    Is.EqualTo(observation.ObservedStopwatchTicks));
+                Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.Ping,
+                    PacketFlags.ReliableOrdered, 32)), Is.True);
+                Assert.That(endpoint.TryGetActiveTicket(out var control), Is.True);
+                client.Driver.OnDelivery(null, control);
+                Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                    PacketFlags.ReliableOrdered, 32, 21)), Is.True);
+                Assert.That(endpoint.TryGetActiveTicket(out var retired), Is.True);
+                Assert.That(retired.Retire(), Is.True);
+                client.Driver.OnDelivery(null, retired);
+                client.Driver.ThrowOnNextReliableSubmit = true;
+                Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                    PacketFlags.ReliableOrdered, 32, 22)), Is.False);
+                Assert.That(endpoint.LastSnapshotDeliveryObservation.SnapshotServerTick, Is.EqualTo(20));
+                Assert.That(endpoint.LastSnapshotDeliveryObservation.ObservedStopwatchTicks,
+                    Is.EqualTo(observation.ObservedStopwatchTicks));
+            }
         }
 
         [Test]
@@ -284,6 +458,10 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(diagnostics.UnreliableSentPackets, Is.GreaterThanOrEqualTo(1));
                     Assert.That(diagnostics.NativeReliableBytes, Is.EqualTo(0));
                     Assert.That(diagnostics.DeliveryCallbacks, Is.GreaterThanOrEqualTo(2));
+                    Assert.That(diagnostics.OtherDelivery.Samples,
+                        Is.GreaterThanOrEqualTo(1));
+                    Assert.That(diagnostics.SnapshotDelivery.Samples,
+                        Is.GreaterThanOrEqualTo(1));
                     Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
                     Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
 
@@ -341,6 +519,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(complete.PendingReliableBytes, Is.Zero);
                     Assert.That(complete.NativeReliableFragments, Is.Zero);
                     Assert.That(complete.NativeReliableBytes, Is.Zero);
+                    Assert.That(complete.ManagedPromotion.Samples,
+                        Is.GreaterThanOrEqualTo(1));
                     Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
                     Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
                 }
@@ -3091,6 +3271,23 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 return checked((ushort)((IPEndPoint)socket.Client.LocalEndPoint).Port);
         }
 
+        private static LiteNetLibDriver.DeliveryTicket NewObservationTicket(
+            LiteNetLibDriver driver, LiteNetLibEndpoint endpoint)
+        {
+            var ticket = new LiteNetLibDriver.DeliveryTicket(driver);
+            ticket.Reset(endpoint, 1, PacketHeader.Size + 32, false, 0, 0);
+            return ticket;
+        }
+
+        private static T InvokePrivate<T>(object target, string methodName,
+            params object[] arguments)
+        {
+            var method = target.GetType().GetMethod(methodName,
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.That(method, Is.Not.Null, $"Missing private method {methodName}.");
+            return (T)method.Invoke(target, arguments);
+        }
+
         [Test]
         public void ThreadedIoDefaultsToFalseAndSurvivesNormalize()
         {
@@ -3102,6 +3299,21 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             enabled.ThreadedIo = true;
             Assert.That(enabled.Normalize(false).ThreadedIo, Is.True);
             Assert.That(enabled.Normalize(true).ThreadedIo, Is.True);
+        }
+
+        [Test]
+        public void NativeSocketsDefaultsToFalseAndRequiresThreadedIo()
+        {
+            Assert.That(LiteNetLibSettings.Default.UseNativeSockets, Is.False);
+            Assert.That(LiteNetLibSettings.Default.Normalize(true).UseNativeSockets,
+                Is.False);
+
+            var enabled = LiteNetLibSettings.Default;
+            enabled.UseNativeSockets = true;
+            Assert.Throws<ArgumentException>(() => enabled.Normalize(true));
+
+            enabled.ThreadedIo = true;
+            Assert.That(enabled.Normalize(true).UseNativeSockets, Is.True);
         }
 
         [Test]
@@ -3165,6 +3377,80 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
                     Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.EqualTo(0));
                 }
+            }
+        }
+
+        [Test]
+        public void NativeSocketServerLoopbackWithManagedClientDeliversAndDrains()
+        {
+            var nativeSocketPlatform = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ||
+                RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+            if (!nativeSocketPlatform)
+                Assert.Ignore("LiteNetLib native sockets are unsupported on this platform.");
+
+            var port = FindFreePort();
+            var serverSettings = LiteNetLibSettings.Default;
+            serverSettings.Address = "127.0.0.1";
+            serverSettings.Port = port;
+            serverSettings.ThreadedIo = true;
+            serverSettings.UseNativeSockets = true;
+
+            var clientSettings = serverSettings;
+            clientSettings.UseNativeSockets = false;
+
+            using (var server = new LiteNetLibServerHost(serverSettings))
+            using (var client = new LiteNetLibClientHost(clientSettings))
+            using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+            {
+                Assert.That(server.NativeSocketsEnabled, Is.True);
+                Assert.That(client.NativeSocketsEnabled, Is.False);
+                Assert.That(server.NativeDeliveryEvents, Is.False);
+                Assert.That(client.NativeDeliveryEvents, Is.False);
+
+                var serverEndpoint = WaitForAccept(server, client);
+                Assert.That(client.Connected, Is.True);
+
+                var clientSequenced = CreatePacket(pool, PacketKind.Ping,
+                    PacketFlags.UnreliableSequenced, 32);
+                Assert.That(client.Endpoint.TrySend(clientSequenced), Is.True);
+                var receivedClientSequenced = WaitForReceive(server, client, serverEndpoint);
+                AssertPacket(receivedClientSequenced, PacketKind.Ping,
+                    PacketFlags.UnreliableSequenced, 32);
+                receivedClientSequenced.Dispose();
+
+                var clientCallbacks = client.CaptureDiagnostics().DeliveryCallbacks;
+                var clientReliable = CreatePacket(pool, PacketKind.TransactionCommand,
+                    PacketFlags.ReliableOrdered, 15000);
+                Assert.That(client.Endpoint.TrySend(clientReliable), Is.True);
+                var receivedClientReliable = WaitForReceive(server, client, serverEndpoint);
+                AssertPacket(receivedClientReliable, PacketKind.TransactionCommand,
+                    PacketFlags.ReliableOrdered, 15000);
+                receivedClientReliable.Dispose();
+                WaitForDeliveryAtLeast(server, client, clientCallbacks + 1);
+
+                var serverSequenced = CreatePacket(pool, PacketKind.Pong,
+                    PacketFlags.UnreliableSequenced, 32);
+                Assert.That(serverEndpoint.TrySend(serverSequenced), Is.True);
+                var receivedServerSequenced = WaitForReceive(server, client, client.Endpoint);
+                AssertPacket(receivedServerSequenced, PacketKind.Pong,
+                    PacketFlags.UnreliableSequenced, 32);
+                receivedServerSequenced.Dispose();
+
+                var serverCallbacks = server.CaptureDiagnostics().DeliveryCallbacks;
+                var serverReliable = CreatePacket(pool, PacketKind.TransactionCommand,
+                    PacketFlags.ReliableOrdered, 15000);
+                Assert.That(serverEndpoint.TrySend(serverReliable), Is.True);
+                var receivedServerReliable = WaitForReceive(server, client, client.Endpoint);
+                AssertPacket(receivedServerReliable, PacketKind.TransactionCommand,
+                    PacketFlags.ReliableOrdered, 15000);
+                receivedServerReliable.Dispose();
+                WaitForServerDelivery(server, client, serverCallbacks + 1);
+
+                serverEndpoint.Dispose();
+                WaitForDisconnect(server, client);
+                Assert.That(server.CaptureDiagnostics().Connections, Is.Zero);
+                Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.Zero);
             }
         }
 

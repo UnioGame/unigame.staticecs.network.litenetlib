@@ -28,6 +28,12 @@ flowchart LR
 | Manual | On the tick thread: `PollEvents` and `ManualUpdate` | `ThreadedIo = false` |
 | Threaded | LiteNetLib receive and logic threads; the tick thread only dispatches events and wakes the sender | `ThreadedIo = true` (server default) |
 
+`UseNativeSockets` is an opt-in experimental LiteNetLib server setting. It requires
+`ThreadedIo = true`, remains false by default, and is clamped by LiteNetLib to its
+supported Windows/Linux platforms. `NativeSocketsEnabled` reports the effective
+post-start state, so unsupported platforms are observable without changing the
+managed callback and ownership model.
+
 In both modes every listener callback runs on the tick thread inside `Update()`, so adapter
 and protocol state stay single-threaded. Threaded mode makes the server tick 2–3× shorter.
 
@@ -50,5 +56,11 @@ and protocol state stay single-threaded. Threaded mode makes the server tick 2�
 | `NativeSentPackets`, `NativeReceivedPackets` | Cumulative UDP datagrams |
 | `NativeSentBytes`, `NativeReceivedBytes` | Datagram payload bytes, including control, fragment and resend traffic |
 | `NativePacketLoss` | LiteNetLib's detected loss or resend accounting |
+| `SnapshotDelivery`, `OtherDelivery` | Native submission to owner delivery callback, including event/poll delay |
+| `ManagedPromotion` | Managed FIFO enqueue to native submission |
+| `OwnerPollInterval`, `OwnerPollDuration` | Owner PollEvents start intervals (first omitted) and processing durations |
 
 In threaded mode the pool and queue counters are sampled across threads, so they are approximate.
+Endpoint snapshot observations publish only successful delivery callbacks; retirement,
+failed submission, control packets and duplicate callbacks cannot advance them. The native
+ACK and delivery-event generation timestamps are unavailable through the transport API.
