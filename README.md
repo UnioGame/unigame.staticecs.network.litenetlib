@@ -37,6 +37,18 @@ managed callback and ownership model.
 In both modes every listener callback runs on the tick thread inside `Update()`, so adapter
 and protocol state stay single-threaded. Threaded mode makes the server tick 2–3× shorter.
 
+## Timing
+
+| `LiteNetLibSettings` | Default | Meaning |
+|---|---:|---|
+| `UpdateTimeMs` | 1 | Logic-thread interval between flushes, threaded mode only; LiteNetLib's own default is 15 |
+| `DisconnectTimeoutMs` | 5000 | Silence after which LiteNetLib drops a peer |
+| `PingIntervalMs` | 1000 | Time between keep-alive pings |
+| `ConnectAttemptIntervalMs` / `MaximumConnectAttempts` | 500 / 10 | Pause between connection requests of a client and their number before it gives up |
+| `NativePacketPoolSize` | by role | 1000 for a client, `MaximumConnections × 64` clamped to 1000..32768 for a listener |
+
+Except `UpdateTimeMs`, the timing defaults repeat LiteNetLib 2.1.4. A zero selects the default.
+
 ## Contract
 
 - Call `Update()` before protocol receives and `Flush()` after protocol sends; dispose every
@@ -44,9 +56,12 @@ and protocol state stay single-threaded. Threaded mode makes the server tick 2�
 - `TrySend` reads only the packet header (CRC and length): callers pass packets they just
   encoded. The receive path verifies the full packet, payload hash included.
 - Native MTU is 1200 bytes, with one channel. Reliable packets go up to 64 KiB, fragmented by
-  LiteNetLib; sequenced packets are limited to one datagram.
+  LiteNetLib; unreliable packets are limited to one datagram.
+- Packets flagged `PacketFlags.UnreliableSequenced` use plain unreliable native delivery: they may
+  arrive out of order or twice, and the protocol drops what is stale. Native sequencing is not
+  used because it drops the first chunk of a two-chunk snapshot when the second arrives first.
 - The receive queue, the reliable FIFO, delivery-ticket fragments and bytes are bounded per
-  connection. Reliable receive overflow disconnects the peer; sequenced overflow drops the packet.
+  connection. Reliable receive overflow disconnects the peer; unreliable overflow drops the packet.
 
 ## Diagnostics
 

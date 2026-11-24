@@ -62,6 +62,28 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         /// <summary>Native LiteNetLib packet pool size; zero selects a role-based default.</summary>
         public int NativePacketPoolSize;
         /// <summary>
+        /// Milliseconds between two runs of LiteNetLib's logic thread when no flush wakes it; read only
+        /// with <see cref="ThreadedIo"/>. Zero selects <see cref="DefaultUpdateTimeMs"/>.
+        /// </summary>
+        public int UpdateTimeMs;
+        /// <summary>
+        /// Milliseconds without a packet from a peer after which LiteNetLib drops the connection; zero
+        /// selects <see cref="DefaultDisconnectTimeoutMs"/>.
+        /// </summary>
+        public int DisconnectTimeoutMs;
+        /// <summary>Milliseconds between two keep-alive pings of a peer; zero selects <see cref="DefaultPingIntervalMs"/>.</summary>
+        public int PingIntervalMs;
+        /// <summary>
+        /// Milliseconds between two connection requests of a connecting client; zero selects
+        /// <see cref="DefaultConnectAttemptIntervalMs"/>.
+        /// </summary>
+        public int ConnectAttemptIntervalMs;
+        /// <summary>
+        /// Connection requests a client sends before LiteNetLib reports a failed connection; zero selects
+        /// <see cref="DefaultMaximumConnectAttempts"/>.
+        /// </summary>
+        public int MaximumConnectAttempts;
+        /// <summary>
         /// When true, starts LiteNetLib's own receive and logic threads (<c>NetManager.Start</c>) so socket
         /// reads, resend/ping timers, and queued sends run off the calling thread; when false (default),
         /// runs LiteNetLib in manual mode (<c>NetManager.StartInManualMode</c>) and pumps sockets synchronously
@@ -98,8 +120,26 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             ReliableSendBytesCapacity = LiteNetLibLimits.MaximumReliableBytes * 4L,
             NativeReliableFragmentsCapacity = LiteNetLibLimits.MaximumFragmentsCount * NetConstants.DefaultWindowSize,
             NativeReliableBytesCapacity = LiteNetLibLimits.MaximumReliableBytes * (long)NetConstants.DefaultWindowSize,
+            UpdateTimeMs = DefaultUpdateTimeMs,
+            DisconnectTimeoutMs = DefaultDisconnectTimeoutMs,
+            PingIntervalMs = DefaultPingIntervalMs,
+            ConnectAttemptIntervalMs = DefaultConnectAttemptIntervalMs,
+            MaximumConnectAttempts = DefaultMaximumConnectAttempts,
         };
 
+        /// <summary>
+        /// Logic-thread interval of this adapter. A flush wakes the thread at once, so the interval
+        /// only paces the time between ticks; LiteNetLib's own default is 15 ms.
+        /// </summary>
+        public const int DefaultUpdateTimeMs = 1;
+        /// <summary>LiteNetLib 2.1.4 default of <c>NetManager.DisconnectTimeout</c>.</summary>
+        public const int DefaultDisconnectTimeoutMs = 5000;
+        /// <summary>LiteNetLib 2.1.4 default of <c>NetManager.PingInterval</c>.</summary>
+        public const int DefaultPingIntervalMs = 1000;
+        /// <summary>LiteNetLib 2.1.4 default of <c>NetManager.ReconnectDelay</c>.</summary>
+        public const int DefaultConnectAttemptIntervalMs = 500;
+        /// <summary>LiteNetLib 2.1.4 default of <c>NetManager.MaxConnectAttempts</c>.</summary>
+        public const int DefaultMaximumConnectAttempts = 10;
         /// <summary>Maximum complete reliable packet bytes supported by this adapter.</summary>
         public const int MaximumReliableBytes = LiteNetLibLimits.MaximumReliableBytes;
         /// <summary>Smallest native packet pool size this adapter is allowed to configure.</summary>
@@ -139,6 +179,16 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             if (nativePoolSize > MaximumNativePacketPoolSize)
                 nativePoolSize = MaximumNativePacketPoolSize;
             value.NativePacketPoolSize = nativePoolSize;
+            if (value.UpdateTimeMs <= 0)
+                value.UpdateTimeMs = DefaultUpdateTimeMs;
+            if (value.DisconnectTimeoutMs <= 0)
+                value.DisconnectTimeoutMs = DefaultDisconnectTimeoutMs;
+            if (value.PingIntervalMs <= 0)
+                value.PingIntervalMs = DefaultPingIntervalMs;
+            if (value.ConnectAttemptIntervalMs <= 0)
+                value.ConnectAttemptIntervalMs = DefaultConnectAttemptIntervalMs;
+            if (value.MaximumConnectAttempts <= 0)
+                value.MaximumConnectAttempts = DefaultMaximumConnectAttempts;
             if (value.ReliableSendQueueCapacity <= 0)
                 value.ReliableSendQueueCapacity = 64;
             if (value.ReliableSendBytesCapacity <= 0)
@@ -563,6 +613,19 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 MaxFragmentsCount = LiteNetLibLimits.MaximumFragmentsCount,
                 MaxPacketPerManualReceive = Math.Max(1, settings.ReceiveQueueCapacity),
                 PacketPoolSize = settings.NativePacketPoolSize,
+                // A driver built from settings that skipped Normalize keeps the defaults.
+                DisconnectTimeout = settings.DisconnectTimeoutMs > 0
+                    ? settings.DisconnectTimeoutMs
+                    : LiteNetLibSettings.DefaultDisconnectTimeoutMs,
+                PingInterval = settings.PingIntervalMs > 0
+                    ? settings.PingIntervalMs
+                    : LiteNetLibSettings.DefaultPingIntervalMs,
+                ReconnectDelay = settings.ConnectAttemptIntervalMs > 0
+                    ? settings.ConnectAttemptIntervalMs
+                    : LiteNetLibSettings.DefaultConnectAttemptIntervalMs,
+                MaxConnectAttempts = settings.MaximumConnectAttempts > 0
+                    ? settings.MaximumConnectAttempts
+                    : LiteNetLibSettings.DefaultMaximumConnectAttempts,
                 UseNativeSockets = settings.UseNativeSockets,
                 UnsyncedEvents = false,
                 UnsyncedReceiveEvent = false,
@@ -572,10 +635,12 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             {
                 // TriggerUpdate() wakes the logic thread immediately after every Flush(), so this
                 // interval is only a fallback cadence (e.g. between ticks); Windows Thread.Sleep
-                // precision (~15 ms by default) means values this low mostly matter as "as fast as
+                // precision (~15 ms by default) means low values mostly matter as "as fast as
                 // the OS scheduler allows", not as an exact period. See LiteNetLib's own doc comment
                 // on NetManager.UpdateTime.
-                _manager.UpdateTime = 1;
+                _manager.UpdateTime = settings.UpdateTimeMs > 0
+                    ? settings.UpdateTimeMs
+                    : LiteNetLibSettings.DefaultUpdateTimeMs;
             }
             try
             {
@@ -879,7 +944,11 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 }
                 try
                 {
-                    endpoint.Peer.Send(packet.Span, DeliveryMethod.Sequenced);
+                    // Plain unreliable delivery: the protocol drops what is stale itself (command
+                    // batches by packet sequence, snapshots and acknowledgements by tick). Native
+                    // sequencing would also drop the first chunk of a two-chunk snapshot whenever
+                    // the network delivers the second one ahead of it.
+                    endpoint.Peer.Send(packet.Span, DeliveryMethod.Unreliable);
                     _sent++;
                     _unreliableSentPackets++;
                     _unreliableSentBytes += packet.Length;
@@ -1161,7 +1230,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         {
             if (endpoint.Peer == null)
                 return _settings.MaximumUnreliableBytes;
-            var native = endpoint.Peer.GetMaxSinglePacketSize(DeliveryMethod.Sequenced);
+            var native = endpoint.Peer.GetMaxSinglePacketSize(DeliveryMethod.Unreliable);
             return Math.Min(_settings.MaximumUnreliableBytes, native);
         }
 
@@ -1225,9 +1294,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
             if (!_endpoints.TryGetValue(peer, out var endpoint) || endpoint.IsDisposed)
                 return;
             var reliable = deliveryMethod == DeliveryMethod.ReliableOrdered;
-            var sequenced = deliveryMethod == DeliveryMethod.Sequenced;
+            var unreliable = deliveryMethod == DeliveryMethod.Unreliable;
             var limit = reliable ? LiteNetLibLimits.MaximumReliableBytes : endpoint.MaxUnreliablePayloadBytes;
-            if (channelNumber != 0 || (!reliable && !sequenced) || reader.IsNull ||
+            if (channelNumber != 0 || (!reliable && !unreliable) || reader.IsNull ||
                 reader.UserDataSize < PacketHeader.Size || reader.UserDataSize > limit)
             {
                 RejectReceive(reliable, endpoint, reader.UserDataSize > LiteNetLibLimits.MaximumReliableBytes);
@@ -1250,7 +1319,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
                 reader.UserDataOffset, reader.UserDataSize));
             if (!NetworkPacket.TryDecode(packet, out var header, out _) ||
                 (header.Flags == PacketFlags.ReliableOrdered) != reliable ||
-                (header.Flags == PacketFlags.UnreliableSequenced) != sequenced)
+                (header.Flags == PacketFlags.UnreliableSequenced) != unreliable)
             {
                 packet.Dispose();
                 RejectReceive(reliable, endpoint, false);
@@ -1735,7 +1804,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
 
     internal sealed class LiteNetLibEndpoint : INetworkTransport,
         INetworkReliableSendPreflight,
-        INetworkReliableSendState, INetworkReliableDeliveryObservation,
+        INetworkReliableSendState, INetworkReliableBacklogState,
+        INetworkReliableDeliveryObservation,
         INetworkDeliveryPhaseTransport
     {
         private readonly LiteNetLibDriver _owner;
@@ -1805,6 +1875,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib
         internal long NativeReliableBytes => _nativeReliableBytes;
         bool INetworkReliableSendState.HasPendingReliablePackets =>
             _pendingReliable.Count > 0 || _nativeReliableBytes > 0;
+        bool INetworkReliableBacklogState.HasQueuedReliablePackets =>
+            _pendingReliable.Count > 0;
         internal int MaxUnreliablePayloadBytes => _owner.GetMaxUnreliableBytes(this);
         public int MaxReliablePayloadBytes => LiteNetLibLimits.MaximumReliableBytes;
         public bool TrySend(NetworkBufferLease packet) => _owner.TrySend(this, packet);

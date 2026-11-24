@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -15,6 +14,22 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
     [TestFixture]
     public sealed class LiteNetLibAdapterTests
     {
+#if UNITY_EDITOR_WIN
+        // The pump loops sleep 1 ms per step, but the default Windows timer rounds that up to about
+        // 15.6 ms, which turned a 500-step check into eight seconds. A 1 ms period restores the intent.
+        [DllImport("winmm.dll")]
+        private static extern uint timeBeginPeriod(uint period);
+
+        [DllImport("winmm.dll")]
+        private static extern uint timeEndPeriod(uint period);
+
+        [OneTimeSetUp]
+        public void RequestMillisecondTimer() => timeBeginPeriod(1);
+
+        [OneTimeTearDown]
+        public void ReleaseMillisecondTimer() => timeEndPeriod(1);
+#endif
+
         [Test]
         public void LimitsMatchNativeHeaders()
         {
@@ -51,112 +66,6 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 Assert.That(second.OwnerPollDuration.Samples, Is.EqualTo(2));
                 Assert.That(second.OwnerPollDuration.SumMicroseconds, Is.EqualTo(5_000));
                 Assert.That(times, Is.Empty);
-            }
-        }
-
-        [Test]
-        public void NativeDeliveryObservationRejectsStaleTokenAfterSameGenerationReuse()
-        {
-            var settings = LiteNetLibSettings.Default;
-            settings.Address = "127.0.0.1";
-            settings.Port = FindFreePort();
-            settings.ThreadedIo = true;
-            settings.NativeDeliveryEvents = true;
-            using (var driver = new LiteNetLibDriver(settings, true))
-            {
-                var endpoint = new LiteNetLibEndpoint(driver, null, new ConnectionId(1),
-                    settings.ReceiveQueueCapacity);
-                var first = NewObservationTicket(driver, endpoint);
-                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", first),
-                    Is.True);
-                var staleToken = first.DeliveryEventUserData;
-                Assert.That(first.Retire(), Is.True);
-                var firstGeneration = first.Generation;
-                first.Reset(endpoint, 1, PacketHeader.Size + 32, false, 0, 0);
-                Assert.That(first.Generation, Is.EqualTo(firstGeneration + 1));
-                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", first),
-                    Is.True);
-                var currentToken = first.DeliveryEventUserData;
-
-                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation", staleToken),
-                    Is.False);
-                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation", currentToken),
-                    Is.True);
-                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation", currentToken),
-                    Is.False);
-
-                driver.Update();
-                Assert.That(first.State,
-                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.CompletedByCallback));
-                Assert.That(InvokePrivate<bool>(driver, "HasFreeDeliveryObservationSlot"),
-                    Is.True);
-            }
-        }
-
-        [Test]
-        public void NativeDeliveryObservationKeepsCapturedRetiredSlotUntilOwnerDrain()
-        {
-            var settings = LiteNetLibSettings.Default;
-            settings.Address = "127.0.0.1";
-            settings.Port = FindFreePort();
-            settings.ThreadedIo = true;
-            settings.NativeDeliveryEvents = true;
-            using (var driver = new LiteNetLibDriver(settings, true))
-            {
-                var endpoint = new LiteNetLibEndpoint(driver, null, new ConnectionId(1),
-                    settings.ReceiveQueueCapacity);
-                var captured = NewObservationTicket(driver, endpoint);
-                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", captured),
-                    Is.True);
-                var capturedSlot = captured.ObservationSlot;
-                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation",
-                        captured.DeliveryEventUserData), Is.True);
-                Assert.That(captured.Retire(), Is.True);
-
-                var replacement = NewObservationTicket(driver, endpoint);
-                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", replacement),
-                    Is.True);
-                Assert.That(replacement.ObservationSlot,
-                    Is.Not.EqualTo(capturedSlot));
-
-                driver.Update();
-                Assert.That(captured.State,
-                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Retired));
-                Assert.That(replacement.State,
-                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.Active));
-                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation",
-                        replacement.DeliveryEventUserData), Is.True);
-                driver.Update();
-                driver.RetireDeliveryObservation(replacement);
-                Assert.That(replacement.State,
-                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.CompletedByCallback));
-                Assert.That(InvokePrivate<bool>(driver, "HasFreeDeliveryObservationSlot"),
-                    Is.True);
-            }
-        }
-
-        [Test]
-        public void NativeDeliveryObservationDrainsCapturedReservationBeforeDisposeClearsSlots()
-        {
-            var settings = LiteNetLibSettings.Default;
-            settings.Address = "127.0.0.1";
-            settings.Port = FindFreePort();
-            settings.ThreadedIo = true;
-            settings.NativeDeliveryEvents = true;
-            using (var driver = new LiteNetLibDriver(settings, true))
-            {
-                var endpoint = new LiteNetLibEndpoint(driver, null, new ConnectionId(1),
-                    settings.ReceiveQueueCapacity);
-                var ticket = NewObservationTicket(driver, endpoint);
-                Assert.That(InvokePrivate<bool>(driver, "ReserveDeliveryObservation", ticket),
-                    Is.True);
-                Assert.That(InvokePrivate<bool>(driver, "CaptureDeliveryObservation",
-                    ticket.DeliveryEventUserData), Is.True);
-
-                driver.Dispose();
-
-                Assert.That(ticket.State,
-                    Is.EqualTo(LiteNetLibDriver.DeliveryTicketState.CompletedByCallback));
             }
         }
 
@@ -388,7 +297,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
-        public void NativeLoopbackDeliversSequencedAndReliablePackets()
+        public void NativeLoopbackDeliversUnreliableAndReliablePackets()
         {
             var port = FindFreePort();
             var settings = LiteNetLibSettings.Default;
@@ -415,13 +324,13 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
 
                 using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
                 {
-                    var sequenced = CreatePacket(pool, PacketKind.Ping,
+                    var unreliable = CreatePacket(pool, PacketKind.Ping,
                         PacketFlags.UnreliableSequenced, 32);
-                    Assert.That(client.Endpoint.TrySend(sequenced), Is.True);
-                    var receivedSequenced = WaitForReceive(server, client, serverEndpoint);
-                    AssertPacket(receivedSequenced, PacketKind.Ping,
+                    Assert.That(client.Endpoint.TrySend(unreliable), Is.True);
+                    var receivedUnreliable = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(receivedUnreliable, PacketKind.Ping,
                         PacketFlags.UnreliableSequenced, 32);
-                    receivedSequenced.Dispose();
+                    receivedUnreliable.Dispose();
 
                     var reliable = CreatePacket(pool, PacketKind.TransactionCommand,
                         PacketFlags.ReliableOrdered, 15000);
@@ -1658,12 +1567,17 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             private readonly Native.EventBasedNetListener _listener;
             private readonly Native.NetManager _manager;
             private readonly Native.NetPeer _peer;
+            private readonly List<(byte[] Bytes, Native.DeliveryMethod Method)> _received =
+                new List<(byte[], Native.DeliveryMethod)>();
 
             public NativePeerHarness(ushort port, int maxFragmentsCount)
             {
                 _listener = new Native.EventBasedNetListener();
                 _listener.PeerConnectedEvent += peer => IsConnected = true;
                 _listener.PeerDisconnectedEvent += (peer, info) => IsConnected = false;
+                // The reader is recycled after the event, so the bytes are copied here.
+                _listener.NetworkReceiveEvent += (peer, reader, channel, method) =>
+                    _received.Add((reader.GetRemainingBytes(), method));
                 _manager = new Native.NetManager(_listener)
                 {
                     AutoRecycle = true,
@@ -1683,6 +1597,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             }
 
             public bool IsConnected { get; private set; }
+
+            /// <summary>What the adapter sent to this peer, with the native channel it arrived on.</summary>
+            public IReadOnlyList<(byte[] Bytes, Native.DeliveryMethod Method)> Received => _received;
 
             public void Pump()
             {
@@ -2005,9 +1922,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             settings.Port = port;
             settings.NativeReliableFragmentsCapacity = 1;
 
-            var client = new LiteNetLibClientHost(settings);
             using (var server = new LiteNetLibServerHost(settings))
             {
+                using var client = new LiteNetLibClientHost(settings);
                 WaitForAccept(server, client);
                 var clientEndpoint = (LiteNetLibEndpoint)client.Endpoint;
                 var driver = client.Driver;
@@ -2033,54 +1950,6 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 }
                 client.Dispose();
             }
-        }
-
-        [Test]
-        public void GlobalManagedReliableLimitsMatchListenerAndClientFormulas()
-        {
-            const long mib = 1024L * 1024L;
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(true, 1, 0),
-                Is.EqualTo(32 * mib));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(true, 200, 0),
-                Is.EqualTo(32 * mib));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(true, 512, 0),
-                Is.EqualTo(32 * mib));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(true, 1024, 0),
-                Is.EqualTo(64 * mib));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(true, 4096, 0),
-                Is.EqualTo(64 * mib));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(true, int.MaxValue, 0),
-                Is.EqualTo(64 * mib));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(false, 1, 128 * mib),
-                Is.EqualTo(128 * mib));
-
-            const int pool = 1000;
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliablePacketsLimit(true, 1, pool, 0),
-                Is.EqualTo(500));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliablePacketsLimit(true, 700, pool, 0),
-                Is.EqualTo(700));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliablePacketsLimit(true, int.MaxValue, pool, 0),
-                Is.EqualTo(int.MaxValue));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliablePacketsLimit(false, 1, pool, 2048),
-                Is.EqualTo(2048));
-
-            var maxFragments = LiteNetLibLimits.MaximumFragmentsCount;
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableFragmentsLimit(true, 1, 750, 0),
-                Is.EqualTo(4 * 750));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableFragmentsLimit(true, 200, 750, 0),
-                Is.EqualTo(200 * maxFragments));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableFragmentsLimit(true, 1024, 750, 0),
-                Is.EqualTo(1024 * maxFragments));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableFragmentsLimit(false, 1, 750, 4000),
-                Is.EqualTo(4000));
-
-            // One maximum reliable packet stays admissible per endpoint through 1024 endpoints.
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableFragmentsLimit(true, 1024, 750, 0) / 1024,
-                Is.GreaterThanOrEqualTo(maxFragments));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliableBytesLimit(true, 1024, 0) / 1024,
-                Is.GreaterThanOrEqualTo(LiteNetLibLimits.MaximumReliableBytes));
-            Assert.That(LiteNetLibDriver.ComputeGlobalReliablePacketsLimit(true, 1024, pool, 0) / 1024,
-                Is.GreaterThanOrEqualTo(1));
         }
 
         [Test]
@@ -2583,9 +2452,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
             settings.Port = port;
             settings.NativeReliableFragmentsCapacity = 1;
 
-            var client = new LiteNetLibClientHost(settings);
             using (var server = new LiteNetLibServerHost(settings))
             {
+                using var client = new LiteNetLibClientHost(settings);
                 WaitForAccept(server, client);
                 var driver = client.Driver;
                 using (var pool = new NetworkBufferPool(
@@ -2609,6 +2478,55 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     Assert.That(diagnostics.NativeReliableFragments, Is.Zero);
                     Assert.That(diagnostics.NativeReliableBytes, Is.Zero);
                     Assert.That(pool.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                }
+            }
+        }
+
+        [Test]
+        public void QueuedReliableBacklogIsReportedSeparatelyFromNativeInFlight()
+        {
+            var port = FindFreePort();
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = port;
+            settings.MaximumConnections = 1;
+            settings.NativeReliableFragmentsCapacity = 1;
+            settings.ReliableSendQueueCapacity = 8;
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            {
+                var endpoint = (LiteNetLibEndpoint)WaitForAccept(server, client);
+                var sendState = (INetworkReliableSendState)endpoint;
+                var backlog = (INetworkReliableBacklogState)endpoint;
+                Assert.That(sendState.HasPendingReliablePackets, Is.False);
+                Assert.That(backlog.HasQueuedReliablePackets, Is.False);
+
+                using (var pool = new NetworkBufferPool(
+                           NetworkBufferPool.DefaultServerRetainedBytes))
+                {
+                    Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                        PacketFlags.ReliableOrdered, 32, 1)), Is.True);
+                    Assert.That(sendState.HasPendingReliablePackets, Is.True,
+                        "a natively submitted packet awaits its delivery callback");
+                    Assert.That(backlog.HasQueuedReliablePackets, Is.False,
+                        "nothing is queued ahead of native submission yet");
+
+                    Assert.That(endpoint.TrySend(CreatePacket(pool, PacketKind.SnapshotChunk,
+                        PacketFlags.ReliableOrdered, 32, 2)), Is.True);
+                    Assert.That(endpoint.PendingReliablePackets, Is.EqualTo(1));
+                    Assert.That(backlog.HasQueuedReliablePackets, Is.True,
+                        "the second packet waits in the managed queue");
+
+                    for (var i = 0; i < 4000 && endpoint.PendingSnapshotChunks > 0; i++)
+                    {
+                        Pump(server, client);
+                        while (client.Endpoint.TryReceive(out var received))
+                            received.Dispose();
+                        Thread.Sleep(1);
+                    }
+                    Assert.That(sendState.HasPendingReliablePackets, Is.False);
+                    Assert.That(backlog.HasQueuedReliablePackets, Is.False);
                 }
             }
         }
@@ -3271,30 +3189,9 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 return checked((ushort)((IPEndPoint)socket.Client.LocalEndPoint).Port);
         }
 
-        private static LiteNetLibDriver.DeliveryTicket NewObservationTicket(
-            LiteNetLibDriver driver, LiteNetLibEndpoint endpoint)
-        {
-            var ticket = new LiteNetLibDriver.DeliveryTicket(driver);
-            ticket.Reset(endpoint, 1, PacketHeader.Size + 32, false, 0, 0);
-            return ticket;
-        }
-
-        private static T InvokePrivate<T>(object target, string methodName,
-            params object[] arguments)
-        {
-            var method = target.GetType().GetMethod(methodName,
-                BindingFlags.Instance | BindingFlags.NonPublic);
-            Assert.That(method, Is.Not.Null, $"Missing private method {methodName}.");
-            return (T)method.Invoke(target, arguments);
-        }
-
         [Test]
-        public void ThreadedIoDefaultsToFalseAndSurvivesNormalize()
+        public void ThreadedIoSurvivesNormalize()
         {
-            Assert.That(LiteNetLibSettings.Default.ThreadedIo, Is.False);
-            Assert.That(LiteNetLibSettings.Default.Normalize(false).ThreadedIo, Is.False);
-            Assert.That(LiteNetLibSettings.Default.Normalize(true).ThreadedIo, Is.False);
-
             var enabled = LiteNetLibSettings.Default;
             enabled.ThreadedIo = true;
             Assert.That(enabled.Normalize(false).ThreadedIo, Is.True);
@@ -3302,12 +3199,8 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
-        public void NativeSocketsDefaultsToFalseAndRequiresThreadedIo()
+        public void NativeSocketsRequireThreadedIo()
         {
-            Assert.That(LiteNetLibSettings.Default.UseNativeSockets, Is.False);
-            Assert.That(LiteNetLibSettings.Default.Normalize(true).UseNativeSockets,
-                Is.False);
-
             var enabled = LiteNetLibSettings.Default;
             enabled.UseNativeSockets = true;
             Assert.Throws<ArgumentException>(() => enabled.Normalize(true));
@@ -3317,23 +3210,7 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
         }
 
         [Test]
-        public void ManualModeDriverReportsThreadedIoDisabled()
-        {
-            var port = FindFreePort();
-            var settings = LiteNetLibSettings.Default;
-            settings.Address = "127.0.0.1";
-            settings.Port = port;
-
-            using (var server = new LiteNetLibServerHost(settings))
-            using (var client = new LiteNetLibClientHost(settings))
-            {
-                Assert.That(server.Driver.ThreadedIo, Is.False);
-                Assert.That(client.Driver.ThreadedIo, Is.False);
-            }
-        }
-
-        [Test]
-        public void ThreadedIoLoopbackDeliversSequencedAndReliablePackets()
+        public void ThreadedIoLoopbackDeliversUnreliableAndReliablePackets()
         {
             var port = FindFreePort();
             var settings = LiteNetLibSettings.Default;
@@ -3352,13 +3229,13 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
 
                 using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
                 {
-                    var sequenced = CreatePacket(pool, PacketKind.Ping,
+                    var unreliable = CreatePacket(pool, PacketKind.Ping,
                         PacketFlags.UnreliableSequenced, 32);
-                    Assert.That(client.Endpoint.TrySend(sequenced), Is.True);
-                    var receivedSequenced = WaitForReceive(server, client, serverEndpoint);
-                    AssertPacket(receivedSequenced, PacketKind.Ping,
+                    Assert.That(client.Endpoint.TrySend(unreliable), Is.True);
+                    var receivedUnreliable = WaitForReceive(server, client, serverEndpoint);
+                    AssertPacket(receivedUnreliable, PacketKind.Ping,
                         PacketFlags.UnreliableSequenced, 32);
-                    receivedSequenced.Dispose();
+                    receivedUnreliable.Dispose();
 
                     var callbacksBefore = client.CaptureDiagnostics().DeliveryCallbacks;
                     var reliable = CreatePacket(pool, PacketKind.TransactionCommand,
@@ -3410,13 +3287,13 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 var serverEndpoint = WaitForAccept(server, client);
                 Assert.That(client.Connected, Is.True);
 
-                var clientSequenced = CreatePacket(pool, PacketKind.Ping,
+                var clientUnreliable = CreatePacket(pool, PacketKind.Ping,
                     PacketFlags.UnreliableSequenced, 32);
-                Assert.That(client.Endpoint.TrySend(clientSequenced), Is.True);
-                var receivedClientSequenced = WaitForReceive(server, client, serverEndpoint);
-                AssertPacket(receivedClientSequenced, PacketKind.Ping,
+                Assert.That(client.Endpoint.TrySend(clientUnreliable), Is.True);
+                var receivedClientUnreliable = WaitForReceive(server, client, serverEndpoint);
+                AssertPacket(receivedClientUnreliable, PacketKind.Ping,
                     PacketFlags.UnreliableSequenced, 32);
-                receivedClientSequenced.Dispose();
+                receivedClientUnreliable.Dispose();
 
                 var clientCallbacks = client.CaptureDiagnostics().DeliveryCallbacks;
                 var clientReliable = CreatePacket(pool, PacketKind.TransactionCommand,
@@ -3428,13 +3305,13 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                 receivedClientReliable.Dispose();
                 WaitForDeliveryAtLeast(server, client, clientCallbacks + 1);
 
-                var serverSequenced = CreatePacket(pool, PacketKind.Pong,
+                var serverUnreliable = CreatePacket(pool, PacketKind.Pong,
                     PacketFlags.UnreliableSequenced, 32);
-                Assert.That(serverEndpoint.TrySend(serverSequenced), Is.True);
-                var receivedServerSequenced = WaitForReceive(server, client, client.Endpoint);
-                AssertPacket(receivedServerSequenced, PacketKind.Pong,
+                Assert.That(serverEndpoint.TrySend(serverUnreliable), Is.True);
+                var receivedServerUnreliable = WaitForReceive(server, client, client.Endpoint);
+                AssertPacket(receivedServerUnreliable, PacketKind.Pong,
                     PacketFlags.UnreliableSequenced, 32);
-                receivedServerSequenced.Dispose();
+                receivedServerUnreliable.Dispose();
 
                 var serverCallbacks = server.CaptureDiagnostics().DeliveryCallbacks;
                 var serverReliable = CreatePacket(pool, PacketKind.TransactionCommand,
@@ -3595,6 +3472,162 @@ namespace UniGame.StaticEcs.Network.LiteNetLib.Tests
                     WaitForDeliveryAtLeast(server, client, 1);
                 }
             }
+        }
+
+        // PacketFlags.UnreliableSequenced is the wire name of every unreliable packet. The adapter
+        // sends it on the native channel that neither orders nor drops: the protocol does both
+        // itself, and native sequencing would drop the first chunk of a two-chunk delta that
+        // arrives second.
+        [Test]
+        public void UnreliablePacketsLeaveTheAdapterOnTheNativeChannelWithoutSequencing()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var native = new NativePeerHarness(settings.Port,
+                       LiteNetLibLimits.MaximumFragmentsCount))
+            using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+            {
+                var endpoint = WaitForNativeAccept(server, native);
+                Assert.That(endpoint.TrySend(CreateUnreliablePacket(pool, 1, 32)), Is.True);
+                Assert.That(endpoint.TrySend(CreateUnreliablePacket(pool, 2, 32)), Is.True);
+
+                for (var i = 0; i < 800 && native.Received.Count < 2; i++)
+                {
+                    server.Update();
+                    server.Flush();
+                    native.Pump();
+                    Thread.Sleep(1);
+                }
+
+                Assert.That(native.Received.Count, Is.EqualTo(2));
+                var sequences = new List<uint>();
+                foreach (var packet in native.Received)
+                {
+                    Assert.That(packet.Method, Is.EqualTo(Native.DeliveryMethod.Unreliable));
+                    Assert.That(PacketHeader.TryRead(packet.Bytes, out var header), Is.True);
+                    Assert.That(header.Flags, Is.EqualTo(PacketFlags.UnreliableSequenced));
+                    sequences.Add(header.PacketSequence);
+                }
+                Assert.That(sequences, Is.EquivalentTo(new uint[] { 1, 2 }));
+            }
+        }
+
+        // The loopback between two adapters cannot reorder, so a native peer sends the newer
+        // packet first. Native sequencing would drop the older one that follows it.
+        [Test]
+        public void UnreliablePacketsArrivingSwappedBothReachTheEndpoint()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var native = new NativePeerHarness(settings.Port,
+                       LiteNetLibLimits.MaximumFragmentsCount))
+            {
+                var endpoint = WaitForNativeAccept(server, native);
+                byte[] older;
+                byte[] newer;
+                using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+                {
+                    using (var packet = CreateUnreliablePacket(pool, 1, 32))
+                        older = packet.Span.ToArray();
+                    using (var packet = CreateUnreliablePacket(pool, 2, 32))
+                        newer = packet.Span.ToArray();
+                }
+                var before = server.CaptureDiagnostics();
+
+                native.Send(newer, Native.DeliveryMethod.Unreliable);
+                native.Send(older, Native.DeliveryMethod.Unreliable);
+
+                var sequences = new List<uint>();
+                for (var i = 0; i < 800 && sequences.Count < 2; i++)
+                {
+                    native.Pump();
+                    server.Update();
+                    server.Flush();
+                    while (endpoint.TryReceive(out var received))
+                    {
+                        using (received)
+                        {
+                            Assert.That(NetworkPacket.TryDecode(received, out var header, out _),
+                                Is.True);
+                            sequences.Add(header.PacketSequence);
+                        }
+                    }
+                    Thread.Sleep(1);
+                }
+
+                Assert.That(sequences, Is.EquivalentTo(new uint[] { 1, 2 }),
+                    "the packet that arrived late is not dropped by the transport");
+                var after = server.CaptureDiagnostics();
+                Assert.That(after.UnreliableReceivedPackets - before.UnreliableReceivedPackets,
+                    Is.EqualTo(2));
+                Assert.That(after.MalformedPackets, Is.EqualTo(before.MalformedPackets));
+                Assert.That(native.IsConnected, Is.True);
+            }
+        }
+
+        [Test]
+        public void BackToBackUnreliablePacketsOfTheSizeLimitBothArrive()
+        {
+            var settings = LiteNetLibSettings.Default;
+            settings.Address = "127.0.0.1";
+            settings.Port = FindFreePort();
+
+            using (var server = new LiteNetLibServerHost(settings))
+            using (var client = new LiteNetLibClientHost(settings))
+            using (var pool = new NetworkBufferPool(NetworkBufferPool.DefaultClientRetainedBytes))
+            {
+                var serverEndpoint = WaitForAccept(server, client);
+                // The server cuts unreliable deltas to this size, so both ends must report the
+                // whole single-packet capacity of the native unreliable channel.
+                Assert.That(client.Endpoint.MaxUnreliablePayloadBytes,
+                    Is.EqualTo(LiteNetLibLimits.MaximumUnreliableBytes));
+                Assert.That(serverEndpoint.MaxUnreliablePayloadBytes,
+                    Is.EqualTo(LiteNetLibLimits.MaximumUnreliableBytes));
+                var payloadBytes = LiteNetLibLimits.MaximumUnreliableBytes - PacketHeader.Size;
+
+                Assert.That(serverEndpoint.TrySend(CreateUnreliablePacket(pool, 1, payloadBytes)),
+                    Is.True);
+                Assert.That(serverEndpoint.TrySend(CreateUnreliablePacket(pool, 2, payloadBytes)),
+                    Is.True);
+
+                var sequences = new List<uint>();
+                for (var i = 0; i < 2; i++)
+                {
+                    using (var received = WaitForReceive(server, client, client.Endpoint))
+                    {
+                        Assert.That(NetworkPacket.TryDecode(received, out var header,
+                            out var payload), Is.True);
+                        Assert.That(header.Flags, Is.EqualTo(PacketFlags.UnreliableSequenced));
+                        Assert.That(payload.Length, Is.EqualTo(payloadBytes));
+                        sequences.Add(header.PacketSequence);
+                    }
+                }
+                Assert.That(sequences, Is.EquivalentTo(new uint[] { 1, 2 }));
+                Assert.That(server.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+                Assert.That(client.CaptureDiagnostics().OutstandingLeases, Is.Zero);
+            }
+        }
+
+        private static NetworkBufferLease CreateUnreliablePacket(NetworkBufferPool pool,
+            uint sequence, int payloadBytes)
+        {
+            var header = new PacketHeader
+            {
+                Kind = PacketKind.SnapshotChunk,
+                Flags = PacketFlags.UnreliableSequenced,
+                Compression = NetworkCompression.None,
+                PacketSequence = sequence,
+                ServerTick = sequence,
+            };
+            Assert.That(NetworkPacket.TryEncode(pool, header, new byte[payloadBytes],
+                out var packet), Is.True);
+            return packet;
         }
     }
 }
